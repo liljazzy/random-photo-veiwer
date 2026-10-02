@@ -18,7 +18,7 @@ from tkinter import filedialog, messagebox, simpledialog
 from PIL import Image, ImageOps, ImageTk
 
 APP_NAME = "Photo Viewer"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 # The updater reads this file: {"version": "1.4.1", "url": "https://.../PhotoViewer.exe"}
 UPDATE_URL = "https://raw.githubusercontent.com/liljazzy/random-photo-veiwer/main/version.json"
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PhotoViewer"
@@ -34,6 +34,39 @@ EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
 def resource_path(name):
     """A file bundled with the program (works both from source and from the packaged exe)."""
     return os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), name)
+
+
+def set_window_icon(win):
+    """Give this window its own big and small icon: that is what its taskbar button shows."""
+    try:
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32", use_last_error=True)  # private copy, so our type settings stay local
+        user32.GetAncestor.restype = wintypes.HWND
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+                                      ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        hwnd = user32.GetAncestor(win.winfo_id(), 2)
+        path = resource_path("icon.ico")
+        # ICON_BIG (taskbar, Alt+Tab) and ICON_SMALL (title bars): IMAGE_ICON, LR_LOADFROMFILE
+        for which, px in ((1, 48), (0, 16)):
+            icon = user32.LoadImageW(None, path, 1, px, px, 0x10)
+            if icon:
+                user32.SendMessageW(hwnd, 0x80, which, icon)  # WM_SETICON
+    except Exception:
+        pass
+
+
+def refresh_icon_cache():
+    """Tell Windows to forget cached icons (after an install or update changed them)."""
+    try:
+        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)  # SHCNE_ASSOCCHANGED
+        subprocess.Popen(["ie4uinit.exe", "-show"], creationflags=0x08000000,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
 
 def known_folder(csidl):
@@ -576,6 +609,7 @@ class App(tk.Tk):
             ctypes.windll.user32.SetWindowLongW(hwnd, -20, (style & ~0x80) | 0x40000)
             self.withdraw()
             self.after(10, self.deiconify)
+            self.after(60, lambda: set_window_icon(self))  # after it is shown again
         except Exception:
             pass
 
@@ -1366,6 +1400,7 @@ class App(tk.Tk):
                 'if %n% lss 60 goto retry\r\n'  # the old program is still closing; keep trying ~1 minute
                 f'del "{new}" >nul 2>&1\r\n'
                 ':done\r\n'
+                'ie4uinit.exe -show >nul 2>&1\r\n'  # new icon, not the cached old one
                 'set PYINSTALLER_RESET_ENVIRONMENT=1\r\n'  # start a fresh copy, not a half-shared one
                 f'start "" "{exe}"\r\n'
                 '(goto) 2>nul & del "%~f0"\r\n')

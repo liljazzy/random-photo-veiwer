@@ -8,7 +8,8 @@ import tkinter as tk
 import winreg
 from tkinter import messagebox
 
-from photo_viewer import APP_NAME, APP_VERSION, UNINSTALL_KEY, known_folder, resource_path
+from photo_viewer import (APP_NAME, APP_VERSION, UNINSTALL_KEY, known_folder, refresh_icon_cache,
+                          resource_path)
 
 CSIDL_PROGRAMS, CSIDL_DESKTOP = 0x02, 0x10
 
@@ -59,6 +60,7 @@ def install(dest, shortcut_dirs, key, src_exe, version=APP_VERSION):
                           "DisplayIcon": exe,
                           "UninstallString": f'"{exe}" --uninstall'}.items():
             winreg.SetValueEx(k, name, 0, winreg.REG_SZ, val)
+    refresh_icon_cache()  # so shortcuts and the taskbar pick up the icon right away
     return warnings
 
 
