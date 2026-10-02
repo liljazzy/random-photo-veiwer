@@ -1,4 +1,5 @@
 import json
+import queue
 import math
 import os
 import re
@@ -17,7 +18,7 @@ from tkinter import filedialog, messagebox, simpledialog
 from PIL import Image, ImageOps, ImageTk
 
 APP_NAME = "Photo Viewer"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 # Point this at a JSON file you host: {"version": "1.1.0", "url": "https://.../PhotoViewer.exe"}
 UPDATE_URL = "https://raw.githubusercontent.com/liljazzy/random-photo-veiwer/main/version.json"
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PhotoViewer"
@@ -52,9 +53,22 @@ class Body:
         self.samples = deque(maxlen=8)
         self.pull = (0.0, 0.0)
         self.rmoved = False
+        self._sz = None       # size measured once per physics frame
+        self.known = None     # size just set by us, trusted until Tk catches up
+        self.known_until = 0.0
+
+    def measure(self):
+        return max(self.win.winfo_width(), 1), max(self.win.winfo_height(), 1)
 
     def size(self):
-        return max(self.win.winfo_width(), 1), max(self.win.winfo_height(), 1)
+        if self._sz:
+            return self._sz
+        if self.known and time.perf_counter() < self.known_until:
+            return self.known
+        return self.measure()
+
+    def set_known(self, w, h):
+        self.known, self.known_until = (w, h), time.perf_counter() + 0.2
 
     def place(self):
         key = (round(self.pos[0]), round(self.pos[1]))
@@ -149,6 +163,139 @@ class Body:
         self.app.start_physics()
 
 
+def calc_fit_size(iw, ih, sw, sh, pct):
+    """Window size for a photo of this shape on a screen of sw x sh, at pct% of the full fit."""
+    fit = min(sw * 0.9 / iw, sh * 0.9 / ih)
+    scale = max(min(fit, 1), min(fit, 500 / max(iw, ih)))  # upscale small photos a bit
+    scale = min(scale * pct / 100, fit)  # base size setting, never bigger than the screen
+    return max(int(iw * scale), 200), max(int(ih * scale), 150)
+
+
+class Preloader(threading.Thread):
+    """Decodes and resizes random photos in the background so swapping one in is instant."""
+
+    def __init__(self, files, sw, sh, pct):
+        super().__init__(daemon=True)
+        self.files, self.sw, self.sh, self.pct = files, sw, sh, pct
+        self.q = queue.Queue(maxsize=8)
+        self.running = True
+
+    def run(self):
+        while self.running:
+            try:
+                path = random.choice(self.files)
+                img = Image.open(path)
+                iw, ih = img.size
+                if img.getexif().get(274, 1) in (5, 6, 7, 8):  # rotated photo: width and height swap
+                    iw, ih = ih, iw
+                nw, nh = calc_fit_size(iw, ih, self.sw, self.sh, self.pct)
+                try:
+                    img.draft("RGB", (nw, nh))  # JPEGs decode at reduced size
+                except Exception:
+                    pass
+                img = ImageOps.exif_transpose(img).convert("RGB").resize((nw, nh), Image.BICUBIC)
+                item = (path, img, (nw, nh))
+            except Exception:
+                time.sleep(0.05)
+                continue
+            while self.running:
+                try:
+                    self.q.put(item, timeout=0.2)
+                    break
+                except queue.Full:
+                    pass
+
+    def get(self):
+        try:
+            return self.q.get_nowait()
+        except queue.Empty:
+            return None
+
+    def stop(self):
+        self.running = False
+
+
+SAVER_DEFAULTS = {"windows": 5, "size": 30, "speed": 350, "trigger": "collision", "secs": 4}
+
+
+def settings_path():
+    return os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "PhotoViewer", "settings.json")
+
+
+def load_settings():
+    try:
+        with open(settings_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(**values):
+    data = {**load_settings(), **values}
+    try:
+        os.makedirs(os.path.dirname(settings_path()), exist_ok=True)
+        with open(settings_path(), "w", encoding="utf-8") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
+def saver_config():
+    cfg = dict(SAVER_DEFAULTS)
+    saved = load_settings().get("saver")
+    if isinstance(saved, dict):
+        for k, default in SAVER_DEFAULTS.items():
+            if isinstance(saved.get(k), type(default)) or (k != "trigger" and isinstance(saved.get(k), (int, float))):
+                cfg[k] = saved[k]
+    cfg["trigger"] = cfg["trigger"] if cfg["trigger"] in ("collision", "timer") else "collision"
+    return cfg
+
+
+def build_saver_settings(win, on_preview=None):
+    """Fill `win` (a window or the root) with the screensaver settings; changes save as you make them."""
+    cfg = saver_config()
+    bg, fg = "#1b1b1b", "#eee"
+    win.title("Screensaver settings")
+    win.configure(bg=bg)
+    frame = tk.Frame(win, bg=bg, padx=18, pady=14)
+    frame.pack(fill="both", expand=True)
+    vars_ = {"windows": tk.IntVar(value=cfg["windows"]), "size": tk.IntVar(value=cfg["size"]),
+             "speed": tk.IntVar(value=cfg["speed"]), "secs": tk.IntVar(value=cfg["secs"]),
+             "trigger": tk.StringVar(value=cfg["trigger"])}
+
+    def save(*_):
+        save_settings(saver={k: v.get() for k, v in vars_.items()})
+
+    def slider(row, label, key, lo, hi, unit):
+        tk.Label(frame, text=label, bg=bg, fg=fg, anchor="w").grid(row=row, column=0, sticky="w", pady=6)
+        sc = tk.Scale(frame, from_=lo, to=hi, orient="horizontal", variable=vars_[key], length=240,
+                      bg=bg, fg=fg, troughcolor="#333", highlightthickness=0, showvalue=True)
+        sc.grid(row=row, column=1, padx=10)
+        sc.bind("<ButtonRelease-1>", save)
+        sc.bind("<KeyRelease>", save)
+        tk.Label(frame, text=unit, bg=bg, fg="#999").grid(row=row, column=2, sticky="w")
+
+    slider(0, "Photo windows", "windows", 2, 10, "")
+    slider(1, "Window size", "size", 10, 60, "% of full")
+    slider(2, "Speed", "speed", 100, 1500, "px / second")
+    tk.Label(frame, text="Change a photo", bg=bg, fg=fg, anchor="w").grid(row=3, column=0, sticky="nw", pady=(10, 0))
+    box = tk.Frame(frame, bg=bg)
+    box.grid(row=3, column=1, columnspan=2, sticky="w", pady=(8, 0))
+    for value, text in (("collision", "when a window hits another"), ("timer", "on a timer")):
+        tk.Radiobutton(box, text=text, value=value, variable=vars_["trigger"], command=save, bg=bg, fg=fg,
+                       selectcolor="#333", activebackground=bg, activeforeground=fg).pack(anchor="w")
+    slider(4, "Timer interval", "secs", 1, 30, "seconds")
+    row = tk.Frame(frame, bg=bg)
+    row.grid(row=5, column=0, columnspan=3, pady=(16, 0), sticky="e")
+    if on_preview:
+        tk.Button(row, text="Preview", bg="#3b82f6", fg="white", relief="flat", padx=14, pady=5,
+                  command=lambda: (save(), on_preview())).pack(side="left", padx=6)
+    tk.Button(row, text="Close", bg="#2d2d2d", fg=fg, relief="flat", padx=14, pady=5,
+              command=lambda: (save(), win.destroy())).pack(side="left")
+    win.protocol("WM_DELETE_WINDOW", lambda: (save(), win.destroy()))
+    return win
+
+
 class MenuBar(tk.Frame):
     """The bottom menu: floats over a photo window and scales its buttons to the window's width."""
 
@@ -229,7 +376,7 @@ class PhotoWindow(tk.Toplevel):
         self.label = tk.Label(self, bg="#111", bd=0, cursor="hand2")
         self.label.pack(fill="both", expand=True)
         self.path, self.history, self.hpos = path, [path], 0
-        self.body = Body(app, self)
+        self.body = Body(app, self, blocked=lambda: app.saver)
         self.menu = MenuBar(self, app, self.body, [
             ("Folder", "📂", app.open_folder), ("◀ Back", "◀", self.prev_photo),
             ("Random ▶", "▶", self.next_photo),
@@ -263,6 +410,23 @@ class PhotoWindow(tk.Toplevel):
         self.menu.scale(nw)
         self.body.pos = [float(x), float(y)]
         self.body.placed = None
+        self.body.place()
+
+    def show_prepared(self, item):
+        path, img, (nw, nh) = item
+        ow, oh = self.body.size()
+        mx, my, mw, mh = self.app.monitor_rect()
+        x = min(max(self.body.pos[0] + ow / 2 - nw / 2, mx), mx + mw - nw)
+        y = min(max(self.body.pos[1] + oh / 2 - nh / 2, my), my + mh - nh)
+        self.tk_img = ImageTk.PhotoImage(img)
+        self.label.configure(image=self.tk_img)
+        self.geometry(f"{nw}x{nh}")
+        self.path = path
+        self.history.append(path)
+        self.hpos = len(self.history) - 1
+        self.menu.info.configure(text=os.path.basename(path))
+        self.body.pos, self.body.placed = [float(x), float(y)], None
+        self.body.set_known(nw, nh)
         self.body.place()
 
     def refit(self):
@@ -325,17 +489,24 @@ class App(tk.Tk):
         self.menu_open = False
         self.anchor_btn = self.anchor_menu = None
         self.extras = []  # extra PhotoWindows
+        self.saver = False
+        self.preloader = None
+        self.backdrop = None
+        self._contacts = set()
+        self._touching = set()
+        self._last_change = {}
         self._phys_running = False
         self._phys_id = None
         self._fine_timer = False
         self.update_idletasks()
-        self.body = Body(self, self, blocked=lambda: self.is_full)
+        self.body = Body(self, self, blocked=lambda: self.is_full or self.saver)
         # Bottom menu floats over the photo and only shows when the cursor is near it.
         self.menu = MenuBar(self, self, self.body, [
             ("Folder", "📂", self.open_folder), ("◀ Back", "◀", self.prev),
             ("Random ▶", "▶", self.next),
             (self.auto_label, "Auto", self.auto_menu), (self.bounce_label, "⤴", self.bounce_menu),
             (self.size_label, "⤢", self.size_menu), ("＋ Add", "＋", self.add_image),
+            ("🌙 Saver", "🌙", self.start_screensaver), ("⚙ Setup", "⚙", self.saver_settings),
             ("Fullscreen", "⛶", self.toggle_full),
             ("Updates", "⟳", lambda: self.check_updates(True))],
             closer=self.destroy, grip=True)
@@ -349,6 +520,7 @@ class App(tk.Tk):
         self.bind("<Escape>", lambda e: self.destroy())
         self.bind("<Control-o>", lambda e: self.open_folder())
         self.bind("q", lambda e: self.destroy())
+        self.bind("s", lambda e: self.start_screensaver())
         # Re-render once the window has settled; the label's own size lags behind and can
         # still be the old (larger) one mid-resize, which left the photo stuck enlarged.
         self._rid = None
@@ -384,6 +556,8 @@ class App(tk.Tk):
             pass
 
     def poll_hover(self):
+        if self.saver:
+            return self.after(100, self.poll_hover)
         px, py = self.winfo_pointerxy()
         for win, menu in [(self, self.menu)] + [(ex, ex.menu) for ex in self.extras]:
             x, y, w, h = win.winfo_rootx(), win.winfo_rooty(), win.winfo_width(), win.winfo_height()
@@ -427,22 +601,40 @@ class App(tk.Tk):
             self._fine_timer = False
 
     def physics_step(self):
-        """One frame: slide, bounce off screen edges, bounce windows off each other."""
         self._phys_id = None
         if not self._phys_running:
             return
+        bodies = self.live_bodies()
+        for bd in bodies:
+            bd._sz = bd.size()
+        try:
+            self._physics_step()
+        finally:
+            for bd in bodies:
+                bd._sz = None
+
+    def _physics_step(self):
+        """One frame: slide, bounce off screen edges, bounce windows off each other."""
         now = time.perf_counter()
         dt = min(now - self._tlast, 0.05)
         self._tlast = now
-        e = BOUNCE_LEVELS[self.bounce_name]
+        e = 1.0 if self.saver else BOUNCE_LEVELS[self.bounce_name]
         sx, sy, sw, sh = self._screen
         bodies = self.live_bodies()
         # Sub-step so fast windows can't skip over each other between frames.
         fastest = max([(bd.vel[0] ** 2 + bd.vel[1] ** 2) ** 0.5 for bd in bodies if not bd.held] + [0.0])
         steps = max(1, math.ceil(fastest * dt / 60))
         sub = dt / steps
-        damp = 0.5 ** sub  # speed halves every second
+        damp = 1.0 if self.saver else 0.5 ** sub  # speed halves every second (never in the screensaver)
         overlapping = False
+        self._touching = set()
+        if self.saver:  # keep everything gliding: no window may crawl to a stop
+            for bd in bodies:
+                sp = (bd.vel[0] ** 2 + bd.vel[1] ** 2) ** 0.5
+                floor = self.saver_cfg["speed"] * 0.5
+                if sp < floor:
+                    ang = random.uniform(0, 6.2832) if sp == 0 else math.atan2(bd.vel[1], bd.vel[0])
+                    bd.vel = [floor * math.cos(ang), floor * math.sin(ang)]
         for _ in range(steps):
             for bd in bodies:
                 if bd.held:
@@ -456,7 +648,13 @@ class App(tk.Tk):
                         bd.pos[i], bd.vel[i] = hi, -abs(bd.vel[i]) * e
                 bd.vel = [max(min(v * damp, 10000.0), -10000.0) for v in bd.vel]
             overlapping = self.collide(bodies, e) or overlapping
-        busy = overlapping
+        busy = overlapping or self.saver
+        if self.saver:
+            fresh = self._touching - self._contacts  # pairs that only just touched
+            if fresh and self.saver_cfg["trigger"] == "collision":
+                wins = {w for pair in fresh for w in pair}
+                self.after(0, lambda: self._saver_collided(wins))
+        self._contacts = self._touching
         for bd in bodies:
             if bd.held:
                 continue
@@ -488,6 +686,7 @@ class App(tk.Tk):
                 if ox <= 0 or oy <= 0:
                     continue
                 hit = True
+                self._touching.add((a.win, b.win))
                 ax = 0 if ox < oy else 1  # separate along the shallower overlap
                 pen = ox if ax == 0 else oy
                 ca = a.pos[ax] + (aw if ax == 0 else ah) / 2
@@ -515,6 +714,15 @@ class App(tk.Tk):
                         a.vel[ax] -= n * jmp * ima
                     if not b.held:
                         b.vel[ax] += n * jmp * imb
+                    if ax == 0:  # side-on hit: glance off diagonally, up or down by where it struck
+                        # Which window ran into the other? (the one closing in faster)
+                        hitter, other, hh = (a, b, bh) if va * n >= -vb * n else (b, a, ah)
+                        yc = (max(a.pos[1], b.pos[1]) + min(a.pos[1] + ah, b.pos[1] + bh)) / 2  # contact height
+                        up = -1 if yc < other.pos[1] + hh / 2 else 1  # top half of the other -> up
+                        for bd, away, vdir in ((a, -n, up if hitter is a else -up), (b, n, up if hitter is b else -up)):
+                            sp = (bd.vel[0] ** 2 + bd.vel[1] ** 2) ** 0.5
+                            if not bd.held and sp > 1:
+                                bd.vel = [away * sp / 1.4142, vdir * sp / 1.4142]
         if hit:  # a shove must never push a window off the screen
             for bd in bodies:
                 if not bd.held:
@@ -523,7 +731,151 @@ class App(tk.Tk):
                     bd.pos[1] = min(max(bd.pos[1], sy), sy + sh - h)
         return hit
 
-    def add_image(self):
+    # ---- screensaver ----
+    def saver_settings(self):
+        win = tk.Toplevel(self)
+        build_saver_settings(win, on_preview=lambda: (win.destroy(), self.after(300, self.start_screensaver)))
+
+    def start_screensaver(self, quit_on_exit=False):
+        if self.saver:
+            return
+        if not self.files:
+            messagebox.showinfo(APP_NAME, "Choose a photo folder first.")
+            return self.open_folder()
+        if self.is_full:
+            self.toggle_full()
+        cfg = self.saver_cfg = saver_config()
+        self.saver, self._quit_on_exit = True, quit_on_exit
+        self.preloader = Preloader(self.files, self.winfo_screenwidth(), self.winfo_screenheight(), cfg["size"])
+        self.preloader.start()
+        self._contacts, self._touching = set(), set()
+        w0, h0 = self.winfo_width(), self.winfo_height()
+        self._saved_state = ((self.body.pos[0] + w0 / 2, self.body.pos[1] + h0 / 2), self.geometry(), len(self.extras))
+        self.stop_throw()
+        # Smaller windows so five of them have room to glide without constantly colliding.
+        self._saved_size = self.size_pct
+        self.size_pct = cfg["size"]
+        self.render(fit=True)
+        for ex in self.extras:
+            ex.refit()
+        mx, my, mw, mh = self.monitor_rect()
+        # Black backdrop over the whole screen; the photo windows float on top of it.
+        self.backdrop = tk.Toplevel(self, bg="black", cursor="none")
+        self.backdrop.overrideredirect(True)
+        self.backdrop.attributes("-topmost", True)
+        self.backdrop.geometry(f"{mw}x{mh}+{mx}+{my}")
+        self.backdrop.update_idletasks()
+        place_window(self.backdrop, mx, my)
+        for ex in self.extras:
+            ex.menu.set_shown(False)
+        self.menu.set_shown(False)
+        while len(self.extras) < cfg["windows"] - 1:
+            self.add_image(start=False)
+        wins = [self] + self.extras
+        for w in wins:
+            w.attributes("-topmost", True)
+            w.lift()
+        self.canvas.configure(cursor="none")
+        for ex in self.extras:
+            ex.label.configure(cursor="none")
+        for bd in self.live_bodies():
+            angle = random.uniform(0, 6.2832)
+            speed = cfg["speed"] * random.uniform(0.75, 1.25)
+            bd.vel = [speed * math.cos(angle), speed * math.sin(angle)]
+        self._saver_t0 = time.perf_counter()
+        self._saver_ptr = self.winfo_pointerxy()
+        self.bind_all("<Key>", self._saver_event)
+        self.bind_all("<ButtonPress>", self._saver_event)
+        self.focus_force()
+        self.raise_windows()
+        self.start_physics()
+        self.after(150, self.raise_windows)  # windows finish mapping a moment later
+        self.after(60, self._saver_watch)
+        if cfg["trigger"] == "timer":
+            self.after(int(cfg["secs"] * 1000), self._saver_shuffle)
+
+    def raise_windows(self):
+        """Put the photo windows above the black backdrop (topmost band, without stealing focus)."""
+        if not self.saver:
+            return
+        try:
+            for w in [self] + self.extras:
+                hwnd = ctypes.windll.user32.GetAncestor(w.winfo_id(), 2)
+                # HWND_TOPMOST; SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+                ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0010)
+        except Exception:
+            pass
+
+    def _saver_event(self, e=None):
+        if self.saver and time.perf_counter() - self._saver_t0 > 0.5:
+            self.stop_screensaver()
+
+    def _saver_watch(self):
+        if not self.saver:
+            return
+        px, py = self.winfo_pointerxy()
+        ox, oy = self._saver_ptr
+        if time.perf_counter() - self._saver_t0 > 0.7 and abs(px - ox) + abs(py - oy) > 12:
+            return self.stop_screensaver()
+        self.after(60, self._saver_watch)
+
+    def _saver_shuffle(self):
+        """Every couple of seconds, swap the photo in one random window."""
+        if not self.saver:
+            return
+        self.change_photo(random.choice([self] + self.extras))
+        self.after(int(self.saver_cfg["secs"] * 1000), self._saver_shuffle)
+
+    def change_photo(self, w):
+        item = self.preloader.get() if self.preloader else None
+        if w is self:
+            self.apply_prepared(item) if item else self.next()
+        else:
+            w.show_prepared(item) if item else w.next_photo()
+
+    def _saver_collided(self, wins):
+        """A window hit another one: both get a new photo (one per frame, to keep motion smooth)."""
+        now = time.perf_counter()
+        todo = [w for w in wins if now - self._last_change.get(w, 0) >= 0.4]
+        for i, w in enumerate(todo):
+            self._last_change[w] = now
+            self.after(i * 12, lambda w=w: self.saver and self.change_photo(w))
+
+    def stop_screensaver(self):
+        if not self.saver:
+            return
+        self.saver = False
+        if self.preloader:
+            self.preloader.stop()
+            self.preloader = None
+        self.unbind_all("<Key>")
+        self.unbind_all("<ButtonPress>")
+        self.stop_physics()
+        for bd in self.live_bodies():
+            bd.vel = [0.0, 0.0]
+        if self.backdrop:
+            self.backdrop.destroy()
+            self.backdrop = None
+        pos, geo, n_extras = self._saved_state
+        for ex in self.extras[n_extras:]:  # remove only the windows the saver added
+            ex.destroy()
+        del self.extras[n_extras:]
+        for w in [self] + self.extras:
+            w.attributes("-topmost", False)
+        self.canvas.configure(cursor="hand2")
+        self.size_pct = self._saved_size
+        for ex in self.extras:
+            ex.label.configure(cursor="hand2")
+            ex.refit()
+        if self._quit_on_exit:
+            return self.destroy()
+        # Back to where the window was (same centre), then fit it to the photo showing now.
+        self.body.pos = [pos[0] - self.winfo_width() / 2, pos[1] - self.winfo_height() / 2]
+        self.body.placed = None
+        self.body.place()
+        self.render(fit=True)
+
+    def add_image(self, start=True):
         if not self.files:
             return self.open_folder()
         if len(self.extras) >= 12:
@@ -538,7 +890,8 @@ class App(tk.Tk):
         angle = random.uniform(0, 6.2832)
         speed = random.uniform(500, 1000)
         ex.body.vel = [speed * math.cos(angle), speed * math.sin(angle)]
-        self.start_physics()
+        if start:
+            self.start_physics()
 
     def remove_extra(self, ex):
         if ex in self.extras:
@@ -566,26 +919,11 @@ class App(tk.Tk):
             self.canvas.configure(image="", text="No images found in that folder")
             self.info.configure(text="")
 
-    @staticmethod
-    def settings_path():
-        return os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")),
-                            "PhotoViewer", "settings.json")
-
     def read_settings(self):
-        try:
-            with open(self.settings_path(), encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, ValueError):
-            return {}
+        return load_settings()
 
     def write_settings(self, **values):
-        data = {**self.read_settings(), **values}
-        try:
-            os.makedirs(os.path.dirname(self.settings_path()), exist_ok=True)
-            with open(self.settings_path(), "w", encoding="utf-8") as f:
-                json.dump(data, f)
-        except OSError:
-            pass
+        save_settings(**values)
 
     def open_folder(self):
         saved = self.read_settings().get("folder")
@@ -614,24 +952,33 @@ class App(tk.Tk):
 
     def fit_size(self, iw, ih):
         """Window size for a photo of this shape, from the base size setting."""
-        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        fit = min(sw * 0.9 / iw, sh * 0.9 / ih)
-        scale = max(min(fit, 1), min(fit, 500 / max(iw, ih)))  # upscale small photos a bit
-        scale = min(scale * self.size_pct / 100, fit)  # base size setting, never bigger than the screen
-        return max(int(iw * scale), 200), max(int(ih * scale), 150)
+        return calc_fit_size(iw, ih, self.winfo_screenwidth(), self.winfo_screenheight(), self.size_pct)
 
-    def fit_window(self, iw, ih):
+    def fit_window(self, iw, ih, size=None):
         """Resize the window to the photo's shape (centered on its current spot)."""
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
-        nw, nh = self.fit_size(iw, ih)
+        nw, nh = size or self.fit_size(iw, ih)
         cx, cy = self.body.pos[0] + self.winfo_width() // 2, self.body.pos[1] + self.winfo_height() // 2
         x = round(min(max(cx - nw // 2, 0), max(sw - nw, 0)))
         y = round(min(max(cy - nh // 2, 0), max(sh - nh, 0)))
         self.geometry(f"{nw}x{nh}+{x}+{y}")
-        self.update_idletasks()
+        if not size:
+            self.update_idletasks()
         place_window(self, x, y)
         self.body.pos, self.body.placed = [float(x), float(y)], None
+        self.body.set_known(nw, nh)
         return nw, nh
+
+    def apply_prepared(self, item):
+        """Swap in a photo that was already decoded and resized in the background."""
+        path, img, (nw, nh) = item
+        self.history.append(path)
+        self.pos = len(self.history) - 1
+        self.current = path
+        self.fit_window(0, 0, size=(nw, nh))
+        self.tk_img = ImageTk.PhotoImage(img)
+        self.canvas.configure(image=self.tk_img, text="")
+        self._last_key = (path, nw, nh)
 
     def load_image(self, path):
         """Decode once and keep a screen-sized copy; re-rendering then stays fast."""
@@ -922,8 +1269,18 @@ def uninstall():
 
 
 if __name__ == "__main__":
+    flags = [a.lower().lstrip("/-")[:1] for a in sys.argv[1:]]
     if "--uninstall" in sys.argv:
         tk.Tk().withdraw()
         uninstall()
+    elif "p" in flags:  # screensaver preview pane: nothing to show
+        pass
+    elif "c" in flags:  # screensaver settings dialog (Windows' "Settings" button)
+        root = tk.Tk()
+        build_saver_settings(root)
+        root.mainloop()
     else:
-        App().mainloop()
+        app = App()
+        if "s" in flags:  # run as a Windows screensaver: start at once, quit when touched
+            app.after(400, lambda: app.start_screensaver(quit_on_exit=True))
+        app.mainloop()
