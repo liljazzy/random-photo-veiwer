@@ -7,7 +7,7 @@ import winreg
 from tkinter import messagebox
 
 APP_NAME = "Photo Viewer"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PhotoViewer"
 
 
