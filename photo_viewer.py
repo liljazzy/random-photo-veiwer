@@ -18,7 +18,7 @@ from tkinter import filedialog, messagebox, simpledialog
 from PIL import Image, ImageOps, ImageTk
 
 APP_NAME = "Photo Viewer"
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 # The updater reads this file: {"version": "1.4.1", "url": "https://.../PhotoViewer.exe"}
 UPDATE_URL = "https://raw.githubusercontent.com/liljazzy/random-photo-veiwer/main/version.json"
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PhotoViewer"
@@ -29,6 +29,11 @@ SIZE_LEVELS = (40, 50, 67, 80, 100, 130, 160)  # percent of the full fit-to-scre
 DEFAULT_SIZE = 67
 
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def resource_path(name):
+    """A file bundled with the program (works both from source and from the packaged exe)."""
+    return os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), name)
 
 
 def known_folder(csidl):
@@ -476,6 +481,10 @@ class PhotoWindow(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self, auto_update=True):
         super().__init__()
+        try:
+            self.iconbitmap(default=resource_path("icon.ico"))  # taskbar + dialogs, instead of Tk's feather
+        except tk.TclError:
+            pass
         self.title(f"Random Photo Viewer {APP_VERSION}")
         self.geometry("1000x700")
         self.overrideredirect(True)  # borderless

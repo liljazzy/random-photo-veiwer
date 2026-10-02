@@ -8,7 +8,7 @@ import tkinter as tk
 import winreg
 from tkinter import messagebox
 
-from photo_viewer import APP_NAME, APP_VERSION, UNINSTALL_KEY, known_folder
+from photo_viewer import APP_NAME, APP_VERSION, UNINSTALL_KEY, known_folder, resource_path
 
 CSIDL_PROGRAMS, CSIDL_DESKTOP = 0x02, 0x10
 
@@ -65,6 +65,10 @@ def install(dest, shortcut_dirs, key, src_exe, version=APP_VERSION):
 def main():
     root = tk.Tk()
     root.withdraw()
+    try:
+        root.iconbitmap(default=resource_path("icon.ico"))  # the setup dialogs get the app icon too
+    except tk.TclError:
+        pass
     dest = os.path.join(os.environ["LOCALAPPDATA"], "Programs", "PhotoViewer")
     shortcut_dirs = [d for d in (known_folder(CSIDL_PROGRAMS), known_folder(CSIDL_DESKTOP)) if d]
     if not messagebox.askyesno(f"{APP_NAME} Setup",
