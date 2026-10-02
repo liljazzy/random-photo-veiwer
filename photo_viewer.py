@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import re
 import random
@@ -16,7 +17,7 @@ from tkinter import filedialog, messagebox, simpledialog
 from PIL import Image, ImageOps, ImageTk
 
 APP_NAME = "Photo Viewer"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 # Point this at a JSON file you host: {"version": "1.1.0", "url": "https://.../PhotoViewer.exe"}
 UPDATE_URL = "https://raw.githubusercontent.com/liljazzy/random-photo-veiwer/main/version.json"
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PhotoViewer"
@@ -27,6 +28,271 @@ SIZE_LEVELS = (40, 50, 67, 80, 100, 130, 160)  # percent of the full fit-to-scre
 DEFAULT_SIZE = 67
 
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def place_window(win, x, y):
+    # Win32 move: Tk ignores position changes on borderless windows.
+    try:
+        hwnd = ctypes.windll.user32.GetAncestor(win.winfo_id(), 2)
+        # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
+        ctypes.windll.user32.SetWindowPos(hwnd, 0, round(x), round(y), 0, 0, 0x0001 | 0x0004 | 0x0010 | 0x4000)
+    except Exception:
+        win.geometry(f"+{round(x)}+{round(y)}")
+
+
+class Body:
+    """A window that can be dragged and thrown, bouncing off the screen edges and other windows."""
+
+    def __init__(self, app, win, blocked=lambda: False):
+        self.app, self.win, self.blocked = app, win, blocked
+        self.pos = [float(win.winfo_x()), float(win.winfo_y())]
+        self.vel = [0.0, 0.0]
+        self.held = False
+        self.placed = None
+        self.samples = deque(maxlen=8)
+        self.pull = (0.0, 0.0)
+        self.rmoved = False
+
+    def size(self):
+        return max(self.win.winfo_width(), 1), max(self.win.winfo_height(), 1)
+
+    def place(self):
+        key = (round(self.pos[0]), round(self.pos[1]))
+        if key != self.placed:
+            self.placed = key
+            place_window(self.win, *self.pos)
+
+    def bind(self, widget, on_click, on_right_click):
+        """Left-click = on_click, right-click = on_right_click, right-drag or Alt+drag = move/throw."""
+        widget.bind("<Button-1>", lambda e: None if e.state & 0x20000 else on_click())
+        widget.bind("<Alt-Button-1>", self.start_drag)
+        widget.bind("<Alt-B1-Motion>", self.drag)
+        widget.bind("<ButtonRelease-1>", self.end_drag)
+        widget.bind("<ButtonPress-3>", self._rpress)
+        widget.bind("<B3-Motion>", self._rdrag)
+        widget.bind("<ButtonRelease-3>", lambda e: self._rrelease(e, on_right_click))
+
+    def _rpress(self, e):
+        self.start_drag(e)
+        self.rmoved = False
+        self.rstart = (e.x_root, e.y_root)
+
+    def _rdrag(self, e):
+        if abs(e.x_root - self.rstart[0]) + abs(e.y_root - self.rstart[1]) > 4:
+            self.rmoved = True
+        if self.rmoved:
+            self.drag(e)
+
+    def _rrelease(self, e, on_right_click):
+        if self.rmoved:
+            self.end_drag()
+        else:
+            self.held = False
+            on_right_click()
+
+    def start_drag(self, e):
+        if self.blocked():
+            return
+        self.vel = [0.0, 0.0]
+        self.dx, self.dy = e.x_root - self.pos[0], e.y_root - self.pos[1]
+        self.samples = deque(maxlen=8)
+        self.held = True
+        self.pull = (0.0, 0.0)
+        mx, my, mw, mh = self.app.monitor_rect()
+        w, h = self.size()
+        self.wall = (mx, my, mx + mw - w, my + mh - h)
+
+    def drag(self, e):
+        if self.blocked() or not self.held:
+            return
+        self.samples.append((time.perf_counter(), e.x_root, e.y_root))
+        x, y = e.x_root - self.dx, e.y_root - self.dy
+        l, t, r, b = self.wall
+        cx, cy = min(max(x, l), r), min(max(y, t), b)
+        # The window stops at the screen edge; the cursor carrying on past it is the bowstring.
+        self.pull = (x - cx, y - cy)
+        self.pos = [cx, cy]
+        self.place()
+        if len(self.app.live_bodies()) > 1:
+            self.app.start_physics()  # a held window shoves the others around
+
+    def drag_velocity(self):
+        now = time.perf_counter()
+        recent = [q for q in self.samples if now - q[0] < 0.1]
+        if len(recent) < 2 or recent[-1][0] == recent[0][0]:
+            return 0.0, 0.0
+        dt = recent[-1][0] - recent[0][0]
+        vx, vy = (recent[-1][1] - recent[0][1]) / dt, (recent[-1][2] - recent[0][2]) / dt
+        speed = (vx * vx + vy * vy) ** 0.5
+        if speed > 5000:
+            vx, vy = vx * 5000 / speed, vy * 5000 / speed
+        return vx, vy
+
+    def end_drag(self, e=None):
+        """Let go of a drag: fling the window if the cursor was still moving."""
+        if not self.held:
+            return
+        self.held = False
+        px, py = self.pull
+        self.pull = (0.0, 0.0)
+        if (px * px + py * py) ** 0.5 > 15:
+            # Released while pulled against a wall: slingshot away from it (double force).
+            vx, vy = -px * 28, -py * 28
+            speed = (vx * vx + vy * vy) ** 0.5
+            if speed > 10000:
+                vx, vy = vx * 10000 / speed, vy * 10000 / speed
+            self.vel = [vx, vy]
+        else:
+            vx, vy = self.drag_velocity()
+            if (vx * vx + vy * vy) ** 0.5 >= 150:
+                self.vel = [vx, vy]
+        self.app.start_physics()
+
+
+class MenuBar(tk.Frame):
+    """The bottom menu: floats over a photo window and scales its buttons to the window's width."""
+
+    def __init__(self, owner, app, body, specs, closer, grip=False):
+        super().__init__(owner, bg="#1b1b1b")
+        self.owner, self.app = owner, app
+        self.shown = False
+        self.btns = []  # (button, full-label function, compact label)
+        for full, short, cmd in specs:
+            b = tk.Button(self, bg="#2d2d2d", fg="#eee", relief="flat")
+            b.configure(command=lambda b=b, cmd=cmd: self._press(b, cmd))
+            b.pack(side="left")
+            self.btns.append((b, full if callable(full) else (lambda t=full: t), short))
+        self.info = tk.Label(self, bg="#1b1b1b", fg="#999")
+        self.grip = None
+        if grip:
+            self.grip = tk.Label(self, text="◢", bg="#1b1b1b", fg="#777", cursor="size_nw_se", padx=8)
+            self.grip.pack(side="right")
+            self.grip.bind("<Button-1>", app.start_resize)
+            self.grip.bind("<B1-Motion>", app.do_resize)
+        self.close_btn = tk.Button(self, text="✕", command=closer, bg="#2d2d2d", fg="#eee", relief="flat")
+        self.close_btn.pack(side="right")
+        for w in (self, self.info):  # drag the menu to move the window
+            w.bind("<Button-1>", body.start_drag)
+            w.bind("<B1-Motion>", body.drag)
+            w.bind("<ButtonRelease-1>", body.end_drag)
+
+    def _press(self, button, cmd):
+        self.app.anchor_btn, self.app.anchor_menu = button, self  # popup menus open at this button
+        cmd()
+
+    def style(self, size, compact):
+        font = ("Segoe UI", size)
+        for b, full, short in self.btns:
+            b.configure(text=short if compact else full(), font=font,
+                        padx=size // 2 + 1 if compact else size, pady=size // 2)
+            b.pack_configure(padx=max(size // 2, 2), pady=size // 2 + 2)
+        self.close_btn.configure(font=font, padx=size, pady=size // 2)
+        self.close_btn.pack_configure(padx=max(size // 2, 2))
+        if self.grip:
+            self.grip.configure(font=font)
+        if compact:
+            self.info.pack_forget()
+        else:
+            self.info.configure(font=("Segoe UI", max(size - 1, 6)))
+            self.info.pack(side="left", padx=10, after=self.btns[-1][0])
+
+    def scale(self, width=None):
+        """Size the text and buttons so everything fits the window's width."""
+        w = width or self.owner.winfo_width()
+        base = max(7, min(16, round(w / 90)))
+        for compact in (False, True):
+            for size in range(base, 5 if compact else 7, -1):  # full labels never below 8pt
+                self.style(size, compact)
+                self.update_idletasks()
+                if self.winfo_reqwidth() <= w:
+                    return
+
+    def set_shown(self, on):
+        if on and not self.shown:
+            self.scale()
+            self.place(relx=0, rely=1, anchor="sw", relwidth=1)
+            self.lift()
+            self.shown = True
+        elif not on and self.shown:
+            self.place_forget()
+            self.shown = False
+
+
+class PhotoWindow(tk.Toplevel):
+    """An extra borderless photo window that collides with the others."""
+
+    def __init__(self, app, path, x, y):
+        super().__init__(app)
+        self.app = app
+        self.overrideredirect(True)
+        self.configure(bg="#111")
+        self.label = tk.Label(self, bg="#111", bd=0, cursor="hand2")
+        self.label.pack(fill="both", expand=True)
+        self.path, self.history, self.hpos = path, [path], 0
+        self.body = Body(app, self)
+        self.menu = MenuBar(self, app, self.body, [
+            ("Folder", "📂", app.open_folder), ("◀ Back", "◀", self.prev_photo),
+            ("Random ▶", "▶", self.next_photo),
+            (app.auto_label, "Auto", app.auto_menu), (app.bounce_label, "⤴", app.bounce_menu),
+            (app.size_label, "⤢", app.size_menu), ("＋ Add", "＋", app.add_image)],
+            closer=lambda: app.remove_extra(self))
+        self.body.bind(self.label, self.next_photo, self.prev_photo)
+        self.label.bind("<Button-2>", lambda e: self.reveal())
+        self.show(path, x, y)
+
+    def show(self, path, x=None, y=None):
+        base = Image.open(path)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        try:
+            base.draft("RGB", (sw, sh))
+        except Exception:
+            pass
+        base = ImageOps.exif_transpose(base).convert("RGB")
+        nw, nh = self.app.fit_size(*base.size)
+        if x is None:  # keep the same centre when the shape changes
+            ow, oh = self.body.size()
+            x, y = self.body.pos[0] + ow / 2 - nw / 2, self.body.pos[1] + oh / 2 - nh / 2
+        mx, my, mw, mh = self.app.monitor_rect()
+        x, y = min(max(x, mx), mx + mw - nw), min(max(y, my), my + mh - nh)
+        self.tk_img = ImageTk.PhotoImage(base.resize((nw, nh), Image.BICUBIC))
+        self.label.configure(image=self.tk_img)
+        self.geometry(f"{nw}x{nh}+{round(x)}+{round(y)}")
+        self.update_idletasks()
+        self.path = path
+        self.menu.info.configure(text=os.path.basename(path))
+        self.menu.scale(nw)
+        self.body.pos = [float(x), float(y)]
+        self.body.placed = None
+        self.body.place()
+
+    def refit(self):
+        try:
+            self.show(self.path)
+        except Exception:
+            pass
+
+    def next_photo(self):
+        if self.hpos < len(self.history) - 1:
+            self.hpos += 1
+        elif self.app.files:
+            self.history.append(random.choice(self.app.files))
+            self.hpos = len(self.history) - 1
+        self._show_current()
+
+    def prev_photo(self):
+        if self.hpos > 0:
+            self.hpos -= 1
+            self._show_current()
+
+    def _show_current(self):
+        try:
+            self.show(self.history[self.hpos])
+        except Exception:
+            pass
+
+    def reveal(self):
+        if os.path.exists(self.path):
+            subprocess.Popen(f'explorer /select,"{os.path.normpath(self.path)}"')
 
 
 class App(tk.Tk):
@@ -50,10 +316,6 @@ class App(tk.Tk):
                                text="Open a folder to start (Ctrl+O)")
         self.canvas.pack(fill="both", expand=True)
 
-        # Bottom menu floats over the photo and only shows when the cursor is near it.
-        bar = tk.Frame(self, bg="#1b1b1b")
-        self.bar = bar
-        self.bar_shown = False
         self.auto_on = False
         self.auto_secs = 4
         saved = self.read_settings()
@@ -61,38 +323,23 @@ class App(tk.Tk):
         saved_bounce = saved.get("bounce")
         self.bounce_name = saved_bounce if saved_bounce in BOUNCE_LEVELS else "Normal"
         self.menu_open = False
-        self._dragging = False
-        self._pull = (0.0, 0.0)
-        self._throw_id = None
-        self._samples = deque(maxlen=8)
-        self.btns = []  # (button, full-label function, compact label)
-        for full, short, cmd in [
-                ("Open folder", "📂", self.open_folder), ("◀ Back", "◀", self.prev),
-                ("Random ▶", "▶", self.next),
-                (lambda: f"Auto: {self.auto_secs}s" if self.auto_on else "Auto: off", "Auto", self.auto_menu),
-                (lambda: f"Bounce: {self.bounce_name}", "⤴", self.bounce_menu),
-                (lambda: f"Size: {self.size_pct:g}%", "⤢", self.size_menu),
-                ("Fullscreen", "⛶", self.toggle_full),
-                ("Check for updates", "⟳", lambda: self.check_updates(True))]:
-            b = tk.Button(bar, command=cmd, bg="#2d2d2d", fg="#eee", relief="flat")
-            b.pack(side="left")
-            self.btns.append((b, full if callable(full) else (lambda t=full: t), short))
-            if short == "Auto":
-                self.auto_btn = b
-        self.info = tk.Label(bar, bg="#1b1b1b", fg="#999")
-
-        grip = tk.Label(bar, text="◢", bg="#1b1b1b", fg="#777", cursor="size_nw_se", padx=8)
-        grip.pack(side="right")
-        grip.bind("<Button-1>", self.start_resize)
-        grip.bind("<B1-Motion>", self.do_resize)
-        self.close_btn = tk.Button(bar, text="✕", command=self.destroy, bg="#2d2d2d", fg="#eee",
-                                   relief="flat")
-        self.close_btn.pack(side="right")
-        self.grip = grip
-        for w in (bar, self.info):  # drag the menu to move the window
-            w.bind("<Button-1>", self.start_move)
-            w.bind("<B1-Motion>", self.do_move)
-            w.bind("<ButtonRelease-1>", self.end_drag)
+        self.anchor_btn = self.anchor_menu = None
+        self.extras = []  # extra PhotoWindows
+        self._phys_running = False
+        self._phys_id = None
+        self._fine_timer = False
+        self.update_idletasks()
+        self.body = Body(self, self, blocked=lambda: self.is_full)
+        # Bottom menu floats over the photo and only shows when the cursor is near it.
+        self.menu = MenuBar(self, self, self.body, [
+            ("Folder", "📂", self.open_folder), ("◀ Back", "◀", self.prev),
+            ("Random ▶", "▶", self.next),
+            (self.auto_label, "Auto", self.auto_menu), (self.bounce_label, "⤴", self.bounce_menu),
+            (self.size_label, "⤢", self.size_menu), ("＋ Add", "＋", self.add_image),
+            ("Fullscreen", "⛶", self.toggle_full),
+            ("Updates", "⟳", lambda: self.check_updates(True))],
+            closer=self.destroy, grip=True)
+        self.info = self.menu.info
 
         self.bind("<Right>", lambda e: self.next())
         self.bind("<space>", lambda e: self.next())
@@ -106,20 +353,13 @@ class App(tk.Tk):
         # still be the old (larger) one mid-resize, which left the photo stuck enlarged.
         self._rid = None
         self.bind("<Configure>", self.on_configure)
-        # Click the photo: left = next random photo, right = go back.
-        self.canvas.bind("<Button-1>", lambda e: None if e.state & 0x20000 else self.next())
-        # Right-drag moves the window; a right-click without dragging goes back.
-        self.canvas.bind("<ButtonPress-3>", self.rpress)
-        self.canvas.bind("<B3-Motion>", self.rdrag)
-        self.canvas.bind("<ButtonRelease-3>", self.rrelease)
+        # Click the photo: left = next random photo, right = go back; right-drag / Alt+drag throws.
+        self.body.bind(self.canvas, self.next, self.prev)
         # Middle-click: show this photo in File Explorer.
         self.canvas.bind("<Button-2>", lambda e: self.reveal())
-        # Alt+drag the photo to move the window.
-        self.canvas.bind("<Alt-Button-1>", self.start_move)
-        self.canvas.bind("<Alt-B1-Motion>", self.do_move)
-        self.canvas.bind("<ButtonRelease-1>", self.end_drag)
 
         self.after(50, self.show_in_taskbar)
+        self.after(300, self.sync_body)
         self.after(100, self.poll_hover)
         self.focus_force()
 
@@ -145,126 +385,165 @@ class App(tk.Tk):
 
     def poll_hover(self):
         px, py = self.winfo_pointerxy()
-        x, y, w, h = self.winfo_rootx(), self.winfo_rooty(), self.winfo_width(), self.winfo_height()
-        zone = (self.bar.winfo_height() + 30) if self.bar_shown else 70
-        inside = (x <= px < x + w and y + h - zone <= py < y + h) or self.menu_open
-        if inside and not self.bar_shown:
-            self.bar.place(relx=0, rely=1, anchor="sw", relwidth=1)
-            self.bar.lift()
-            self.bar_shown = True
-        elif not inside and self.bar_shown:
-            self.bar.place_forget()
-            self.bar_shown = False
+        for win, menu in [(self, self.menu)] + [(ex, ex.menu) for ex in self.extras]:
+            x, y, w, h = win.winfo_rootx(), win.winfo_rooty(), win.winfo_width(), win.winfo_height()
+            zone = (menu.winfo_height() + 30) if menu.shown else 70
+            inside = (x <= px < x + w and y + h - zone <= py < y + h) or (
+                self.menu_open and menu is self.anchor_menu)
+            menu.set_shown(inside)
         self.after(100, self.poll_hover)
 
-    def move_to(self, x, y):
-        # Win32 move: Tk ignores position changes on borderless windows.
-        try:
-            hwnd = ctypes.windll.user32.GetAncestor(self.winfo_id(), 2)
-            # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
-            ctypes.windll.user32.SetWindowPos(hwnd, 0, round(x), round(y), 0, 0, 0x0001 | 0x0004 | 0x0010 | 0x4000)
-        except Exception:
-            self.geometry(f"+{int(x)}+{int(y)}")
+    def sync_body(self):
+        # The window manager picks the real start position; learn it once mapped.
+        if not self.body.held and not self._phys_running:
+            self.body.pos = [float(self.winfo_x()), float(self.winfo_y())]
 
-    def start_move(self, e):
-        if self.is_full:
-            return
-        self.stop_throw()
-        self._dx, self._dy = e.x_root - self.winfo_x(), e.y_root - self.winfo_y()
-        self._samples = deque(maxlen=8)
-        self._dragging = True
-        self._pull = (0.0, 0.0)
-        mx, my, mw, mh = self.monitor_rect()
-        self._wall = (mx, my, mx + mw - self.winfo_width(), my + mh - self.winfo_height())
+    def live_bodies(self):
+        return ([] if self.is_full else [self.body]) + [ex.body for ex in self.extras]
 
-    def do_move(self, e):
-        if self.is_full or not self._dragging:
-            return
-        self._samples.append((time.perf_counter(), e.x_root, e.y_root))
-        x, y = e.x_root - self._dx, e.y_root - self._dy
-        l, t, r, b = self._wall
-        cx, cy = min(max(x, l), r), min(max(y, t), b)
-        # The window stops at the screen edge; the cursor carrying on past it is the bowstring.
-        self._pull = (x - cx, y - cy)
-        self.move_to(cx, cy)
+    def stop_throw(self):
+        self.body.vel = [0.0, 0.0]
 
-    def end_drag(self, e=None):
-        """Let go of a window drag: fling the window if the cursor was still moving."""
-        if not self._dragging:
+    def start_physics(self):
+        if self._phys_running:
             return
-        self._dragging = False
-        px, py = self._pull
-        self._pull = (0.0, 0.0)
-        if (px * px + py * py) ** 0.5 > 15:
-            # Released while pulled against a wall: slingshot away from it.
-            vx, vy = -px * 28, -py * 28  # double force
-            speed = (vx * vx + vy * vy) ** 0.5
-            if speed > 10000:
-                vx, vy = vx * 10000 / speed, vy * 10000 / speed
-            self.start_throw(vx, vy)
-            return
-        now = time.perf_counter()
-        recent = [q for q in self._samples if now - q[0] < 0.1]
-        if len(recent) < 2 or recent[-1][0] == recent[0][0]:
-            return
-        dt = recent[-1][0] - recent[0][0]
-        vx, vy = (recent[-1][1] - recent[0][1]) / dt, (recent[-1][2] - recent[0][2]) / dt
-        speed = (vx * vx + vy * vy) ** 0.5
-        if speed < 150:
-            return
-        if speed > 5000:
-            vx, vy = vx * 5000 / speed, vy * 5000 / speed
-        self.start_throw(vx, vy)
-
-    def start_throw(self, vx, vy):
-        self.stop_throw()
-        mx, my, mw, mh = self.monitor_rect()
-        self._bounds = (mx, my, mx + mw, my + mh)
-        self._pos = [float(self.winfo_x()), float(self.winfo_y())]
-        self._vel = [vx, vy]
+        self._phys_running = True
+        self._screen = self.monitor_rect()
         self._tlast = time.perf_counter()
         try:
             ctypes.windll.winmm.timeBeginPeriod(1)  # Windows timers default to ~15ms steps
             self._fine_timer = True
         except Exception:
             self._fine_timer = False
-        self.throw_step()
+        self.physics_step()
 
-    def stop_throw(self):
-        if getattr(self, "_throw_id", None):
-            self.after_cancel(self._throw_id)
-        self._throw_id = None
-        if getattr(self, "_fine_timer", False):
+    def stop_physics(self):
+        self._phys_running = False
+        if self._phys_id:
+            self.after_cancel(self._phys_id)
+        self._phys_id = None
+        if self._fine_timer:
             ctypes.windll.winmm.timeEndPeriod(1)
             self._fine_timer = False
 
-    def throw_step(self):
-        """Slide with friction and bounce off the edges of the screen."""
-        if self.is_full:
-            return self.stop_throw()
+    def physics_step(self):
+        """One frame: slide, bounce off screen edges, bounce windows off each other."""
+        self._phys_id = None
+        if not self._phys_running:
+            return
         now = time.perf_counter()
         dt = min(now - self._tlast, 0.05)
         self._tlast = now
-        l, t, r, b = self._bounds
-        w, h = self.winfo_width(), self.winfo_height()
         e = BOUNCE_LEVELS[self.bounce_name]
-        for i, (lo, hi) in enumerate(((l, r - w), (t, b - h))):
-            self._pos[i] += self._vel[i] * dt
-            if self._pos[i] < lo:
-                self._pos[i], self._vel[i] = lo, abs(self._vel[i]) * e
-            elif self._pos[i] > hi:
-                self._pos[i], self._vel[i] = hi, -abs(self._vel[i]) * e
-        damp = 0.5 ** dt  # speed halves every second
-        self._vel = [v * damp for v in self._vel]
-        self.move_to(*self._pos)
-        if (self._vel[0] ** 2 + self._vel[1] ** 2) ** 0.5 < 25:
-            self.stop_throw()
-        else:
-            try:
-                ctypes.windll.dwmapi.DwmFlush()  # wait for the next screen refresh: even frame pacing
-            except Exception:
-                pass
-            self._throw_id = self.after(1, self.throw_step)
+        sx, sy, sw, sh = self._screen
+        bodies = self.live_bodies()
+        # Sub-step so fast windows can't skip over each other between frames.
+        fastest = max([(bd.vel[0] ** 2 + bd.vel[1] ** 2) ** 0.5 for bd in bodies if not bd.held] + [0.0])
+        steps = max(1, math.ceil(fastest * dt / 60))
+        sub = dt / steps
+        damp = 0.5 ** sub  # speed halves every second
+        overlapping = False
+        for _ in range(steps):
+            for bd in bodies:
+                if bd.held:
+                    continue
+                w, h = bd.size()
+                for i, (lo, hi) in enumerate(((sx, sx + sw - w), (sy, sy + sh - h))):
+                    bd.pos[i] += bd.vel[i] * sub
+                    if bd.pos[i] < lo:
+                        bd.pos[i], bd.vel[i] = lo, abs(bd.vel[i]) * e
+                    elif bd.pos[i] > hi:
+                        bd.pos[i], bd.vel[i] = hi, -abs(bd.vel[i]) * e
+                bd.vel = [max(min(v * damp, 10000.0), -10000.0) for v in bd.vel]
+            overlapping = self.collide(bodies, e) or overlapping
+        busy = overlapping
+        for bd in bodies:
+            if bd.held:
+                continue
+            bd.place()
+            if (bd.vel[0] ** 2 + bd.vel[1] ** 2) ** 0.5 >= 25:
+                busy = True
+        if not busy:
+            for bd in bodies:
+                if not bd.held:
+                    bd.vel = [0.0, 0.0]
+            return self.stop_physics()
+        try:
+            ctypes.windll.dwmapi.DwmFlush()  # wait for the next screen refresh: even frame pacing
+        except Exception:
+            pass
+        self._phys_id = self.after(1, self.physics_step)
+
+    def collide(self, bodies, e):
+        """Push overlapping windows apart and bounce them off each other (heavier = bigger area)."""
+        sx, sy, sw, sh = self._screen
+        hit = False
+        for i in range(len(bodies)):
+            for j in range(i + 1, len(bodies)):
+                a, b = bodies[i], bodies[j]
+                aw, ah = a.size()
+                bw, bh = b.size()
+                ox = min(a.pos[0] + aw, b.pos[0] + bw) - max(a.pos[0], b.pos[0])
+                oy = min(a.pos[1] + ah, b.pos[1] + bh) - max(a.pos[1], b.pos[1])
+                if ox <= 0 or oy <= 0:
+                    continue
+                hit = True
+                ax = 0 if ox < oy else 1  # separate along the shallower overlap
+                pen = ox if ax == 0 else oy
+                ca = a.pos[ax] + (aw if ax == 0 else ah) / 2
+                cb = b.pos[ax] + (bw if ax == 0 else bh) / 2
+                n = 1 if cb >= ca else -1  # from a towards b
+                # A window being dragged pushes along its direction of travel (so a fast drag
+                # can't hop over the other window).
+                if a.held and abs(a.drag_velocity()[ax]) > 100:
+                    n = 1 if a.drag_velocity()[ax] > 0 else -1
+                elif b.held and abs(b.drag_velocity()[ax]) > 100:
+                    n = -1 if b.drag_velocity()[ax] > 0 else 1
+                ima = 0.0 if a.held else 1.0 / (aw * ah)
+                imb = 0.0 if b.held else 1.0 / (bw * bh)
+                total = ima + imb
+                if total == 0:
+                    continue
+                a.pos[ax] -= n * pen * ima / total
+                b.pos[ax] += n * pen * imb / total
+                va = a.drag_velocity()[ax] if a.held else a.vel[ax]
+                vb = b.drag_velocity()[ax] if b.held else b.vel[ax]
+                vn = (vb - va) * n
+                if vn < 0:  # moving towards each other
+                    jmp = -(1 + e) * vn / total
+                    if not a.held:
+                        a.vel[ax] -= n * jmp * ima
+                    if not b.held:
+                        b.vel[ax] += n * jmp * imb
+        if hit:  # a shove must never push a window off the screen
+            for bd in bodies:
+                if not bd.held:
+                    w, h = bd.size()
+                    bd.pos[0] = min(max(bd.pos[0], sx), sx + sw - w)
+                    bd.pos[1] = min(max(bd.pos[1], sy), sy + sh - h)
+        return hit
+
+    def add_image(self):
+        if not self.files:
+            return self.open_folder()
+        if len(self.extras) >= 12:
+            return
+        mx, my, mw, mh = self.monitor_rect()
+        path = random.choice(self.files)
+        try:
+            ex = PhotoWindow(self, path, mx + random.random() * mw * 0.6, my + random.random() * mh * 0.6)
+        except Exception:
+            return
+        self.extras.append(ex)
+        angle = random.uniform(0, 6.2832)
+        speed = random.uniform(500, 1000)
+        ex.body.vel = [speed * math.cos(angle), speed * math.sin(angle)]
+        self.start_physics()
+
+    def remove_extra(self, ex):
+        if ex in self.extras:
+            self.extras.remove(ex)
+        ex.destroy()
 
     def start_resize(self, e):
         if self.is_full:
@@ -333,35 +612,25 @@ class App(tk.Tk):
             self.current = self.history[self.pos]
             self.render(fit=True)
 
-    def rpress(self, e):
-        self.start_move(e)
-        self._rmoved = False
-        self._rstart = (e.x_root, e.y_root)
-
-    def rdrag(self, e):
-        if abs(e.x_root - self._rstart[0]) + abs(e.y_root - self._rstart[1]) > 4:
-            self._rmoved = True
-        if self._rmoved:
-            self.do_move(e)
-
-    def rrelease(self, e):
-        if self._rmoved:
-            self.end_drag()
-        else:
-            self._dragging = False
-            self.prev()
-
-    def fit_window(self, iw, ih):
-        """Resize the window to the photo's shape (centered on its current spot)."""
+    def fit_size(self, iw, ih):
+        """Window size for a photo of this shape, from the base size setting."""
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         fit = min(sw * 0.9 / iw, sh * 0.9 / ih)
         scale = max(min(fit, 1), min(fit, 500 / max(iw, ih)))  # upscale small photos a bit
         scale = min(scale * self.size_pct / 100, fit)  # base size setting, never bigger than the screen
-        nw, nh = max(int(iw * scale), 200), max(int(ih * scale), 150)
-        cx, cy = self.winfo_x() + self.winfo_width() // 2, self.winfo_y() + self.winfo_height() // 2
-        x = min(max(cx - nw // 2, 0), max(sw - nw, 0))
-        y = min(max(cy - nh // 2, 0), max(sh - nh, 0))
+        return max(int(iw * scale), 200), max(int(ih * scale), 150)
+
+    def fit_window(self, iw, ih):
+        """Resize the window to the photo's shape (centered on its current spot)."""
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        nw, nh = self.fit_size(iw, ih)
+        cx, cy = self.body.pos[0] + self.winfo_width() // 2, self.body.pos[1] + self.winfo_height() // 2
+        x = round(min(max(cx - nw // 2, 0), max(sw - nw, 0)))
+        y = round(min(max(cy - nh // 2, 0), max(sh - nh, 0)))
         self.geometry(f"{nw}x{nh}+{x}+{y}")
+        self.update_idletasks()
+        place_window(self, x, y)
+        self.body.pos, self.body.placed = [float(x), float(y)], None
         return nw, nh
 
     def load_image(self, path):
@@ -418,6 +687,20 @@ class App(tk.Tk):
         if self.current and os.path.exists(self.current):
             subprocess.Popen(f'explorer /select,"{os.path.normpath(self.current)}"')
 
+    def auto_label(self):
+        return f"Auto: {self.auto_secs}s" if self.auto_on else "Auto: off"
+
+    def bounce_label(self):
+        return f"Bounce: {self.bounce_name}"
+
+    def size_label(self):
+        return f"Size: {self.size_pct:g}%"
+
+    def refresh_bars(self):
+        self.scale_bar()
+        for ex in self.extras:
+            ex.menu.scale()
+
     def auto_menu(self):
         m = tk.Menu(self, tearoff=0)
         if self.auto_on:
@@ -427,7 +710,7 @@ class App(tk.Tk):
             m.add_command(label=f"Every {n} s" + ("  ✓" if self.auto_on and n == self.auto_secs else ""),
                           command=lambda n=n: self.start_auto(n))
         m.add_command(label="Custom…", command=self.custom_auto)
-        b = self.auto_btn
+        b = self.anchor_btn
         self.menu_open = True  # keep the bottom bar up while the menu is showing
         try:
             m.tk_popup(b.winfo_rootx(), b.winfo_rooty())
@@ -443,7 +726,8 @@ class App(tk.Tk):
                           command=lambda n=name: self.set_bounce(n))
         self.menu_open = True
         try:
-            m.tk_popup(self.btns[4][0].winfo_rootx(), self.btns[4][0].winfo_rooty())
+            btn = self.anchor_btn
+            m.tk_popup(btn.winfo_rootx(), btn.winfo_rooty())
         finally:
             m.grab_release()
             self.menu_open = False
@@ -451,7 +735,7 @@ class App(tk.Tk):
     def set_bounce(self, name):
         self.bounce_name = name
         self.write_settings(bounce=name)
-        self.scale_bar()
+        self.refresh_bars()
 
     def size_menu(self):
         m = tk.Menu(self, tearoff=0)
@@ -460,7 +744,7 @@ class App(tk.Tk):
             tick = "  ✓" if pct == self.size_pct else ""
             m.add_command(label=f"{pct}%{note}{tick}", command=lambda p=pct: self.set_size(p))
         m.add_command(label="Custom…", command=self.custom_size)
-        btn = next(b for b, _, short in self.btns if short == "⤢")
+        btn = self.anchor_btn
         self.menu_open = True
         try:
             m.tk_popup(btn.winfo_rootx(), btn.winfo_rooty())
@@ -477,9 +761,11 @@ class App(tk.Tk):
     def set_size(self, pct):
         self.size_pct = pct
         self.write_settings(size=pct)
-        self.scale_bar()
+        self.refresh_bars()
         if not self.is_full:
             self.render(fit=True)
+        for ex in self.extras:
+            ex.refit()
 
     def custom_auto(self):
         n = simpledialog.askfloat(APP_NAME, "Seconds between photos:", initialvalue=self.auto_secs,
@@ -490,47 +776,26 @@ class App(tk.Tk):
     def start_auto(self, secs):
         self.stop_auto()
         self.auto_secs, self.auto_on = secs, True
-        self.scale_bar()
+        self.refresh_bars()
         self.auto_id = self.after(int(secs * 1000), self.tick)
 
     def stop_auto(self):
         if self.auto_id:
             self.after_cancel(self.auto_id)
         self.auto_id, self.auto_on = None, False
-        self.scale_bar()
+        self.refresh_bars()
 
     def tick(self):
         self.next()
+        for ex in self.extras:
+            ex.next_photo()
         self.auto_id = self.after(int(self.auto_secs * 1000), self.tick)
 
-    def style_bar(self, size, compact):
-        font = ("Segoe UI", size)
-        for b, full, short in self.btns:
-            b.configure(text=short if compact else full(), font=font,
-                        padx=size // 2 + 1 if compact else size, pady=size // 2)
-            b.pack_configure(padx=max(size // 2, 2), pady=size // 2 + 2)
-        self.close_btn.configure(font=font, padx=size, pady=size // 2)
-        self.close_btn.pack_configure(padx=max(size // 2, 2))
-        self.grip.configure(font=font)
-        if compact:
-            self.info.pack_forget()
-        else:
-            self.info.configure(font=("Segoe UI", max(size - 1, 6)))
-            self.info.pack(side="left", padx=10, after=self.btns[-1][0])
-
     def scale_bar(self):
-        """Size the menu's text and buttons so everything fits the window's width."""
-        w = self.winfo_width()
-        base = max(7, min(16, round(w / 90)))
-        for compact in (False, True):
-            for size in range(base, 5 if compact else 7, -1):  # full labels never below 8pt
-                self.style_bar(size, compact)
-                self.bar.update_idletasks()
-                if self.bar.winfo_reqwidth() <= w:
-                    return
+        self.menu.scale()
 
     def on_configure(self, e):
-        if e.widget is not self or self._throw_id or self._dragging:
+        if e.widget is not self or self._phys_running or self.body.held:
             return
         if self._rid:
             self.after_cancel(self._rid)
@@ -574,6 +839,7 @@ class App(tk.Tk):
                 ctypes.windll.user32.SetWindowPos(hwnd, -2, x, y, w, h, 0x0040)
             except Exception:
                 pass
+            self.body.pos, self.body.placed = [float(x), float(y)], None
         else:
             self._normal_geo = self.geometry()
             self.is_full = True
