@@ -18,8 +18,8 @@ from tkinter import filedialog, messagebox, simpledialog
 from PIL import Image, ImageOps, ImageTk
 
 APP_NAME = "Photo Viewer"
-APP_VERSION = "1.4.0"
-# Point this at a JSON file you host: {"version": "1.1.0", "url": "https://.../PhotoViewer.exe"}
+APP_VERSION = "1.4.1"
+# The updater reads this file: {"version": "1.4.1", "url": "https://.../PhotoViewer.exe"}
 UPDATE_URL = "https://raw.githubusercontent.com/liljazzy/random-photo-veiwer/main/version.json"
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PhotoViewer"
 
@@ -29,6 +29,14 @@ SIZE_LEVELS = (40, 50, 67, 80, 100, 130, 160)  # percent of the full fit-to-scre
 DEFAULT_SIZE = 67
 
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def known_folder(csidl):
+    """A Windows special folder (Desktop, Start Menu...), wherever it really lives (e.g. OneDrive)."""
+    buf = ctypes.create_unicode_buffer(260)
+    if ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf) == 0:
+        return buf.value
+    return None
 
 
 def place_window(win, x, y):
@@ -177,7 +185,7 @@ class Preloader(threading.Thread):
     def __init__(self, files, sw, sh, pct):
         super().__init__(daemon=True)
         self.files, self.sw, self.sh, self.pct = files, sw, sh, pct
-        self.q = queue.Queue(maxsize=8)
+        self.q = queue.Queue(maxsize=4)
         self.running = True
 
     def run(self):
@@ -438,7 +446,11 @@ class PhotoWindow(tk.Toplevel):
     def next_photo(self):
         if self.hpos < len(self.history) - 1:
             self.hpos += 1
-        elif self.app.files:
+            return self._show_current()
+        item = self.app.preloader.get() if self.app.preloader else None
+        if item:  # already decoded and sized in the background
+            return self.show_prepared(item)
+        if self.app.files:
             self.history.append(random.choice(self.app.files))
             self.hpos = len(self.history) - 1
         self._show_current()
@@ -451,8 +463,10 @@ class PhotoWindow(tk.Toplevel):
     def _show_current(self):
         try:
             self.show(self.history[self.hpos])
-        except Exception:
-            pass
+        except Exception:  # unreadable or deleted photo: forget it so Back/Next don't get stuck on it
+            if len(self.history) > 1:
+                del self.history[self.hpos]
+                self.hpos = max(0, min(self.hpos, len(self.history) - 1))
 
     def reveal(self):
         if os.path.exists(self.path):
@@ -460,7 +474,7 @@ class PhotoWindow(tk.Toplevel):
 
 
 class App(tk.Tk):
-    def __init__(self):
+    def __init__(self, auto_update=True):
         super().__init__()
         self.title(f"Random Photo Viewer {APP_VERSION}")
         self.geometry("1000x700")
@@ -491,6 +505,7 @@ class App(tk.Tk):
         self.extras = []  # extra PhotoWindows
         self.saver = False
         self.preloader = None
+        self._prepared = None
         self.backdrop = None
         self._contacts = set()
         self._touching = set()
@@ -541,7 +556,7 @@ class App(tk.Tk):
             if start and os.path.isdir(start):
                 self.load(start)
                 break
-        if UPDATE_URL and getattr(sys, "frozen", False):
+        if auto_update and UPDATE_URL and getattr(sys, "frozen", False):
             self.after(1500, lambda: self.check_updates(False))
 
     def show_in_taskbar(self):
@@ -746,8 +761,7 @@ class App(tk.Tk):
             self.toggle_full()
         cfg = self.saver_cfg = saver_config()
         self.saver, self._quit_on_exit = True, quit_on_exit
-        self.preloader = Preloader(self.files, self.winfo_screenwidth(), self.winfo_screenheight(), cfg["size"])
-        self.preloader.start()
+        self.restart_preloader(cfg["size"])
         self._contacts, self._touching = set(), set()
         w0, h0 = self.winfo_width(), self.winfo_height()
         self._saved_state = ((self.body.pos[0] + w0 / 2, self.body.pos[1] + h0 / 2), self.geometry(), len(self.extras))
@@ -845,9 +859,6 @@ class App(tk.Tk):
         if not self.saver:
             return
         self.saver = False
-        if self.preloader:
-            self.preloader.stop()
-            self.preloader = None
         self.unbind_all("<Key>")
         self.unbind_all("<ButtonPress>")
         self.stop_physics()
@@ -864,6 +875,7 @@ class App(tk.Tk):
             w.attributes("-topmost", False)
         self.canvas.configure(cursor="hand2")
         self.size_pct = self._saved_size
+        self.restart_preloader()
         for ex in self.extras:
             ex.label.configure(cursor="hand2")
             ex.refit()
@@ -909,10 +921,21 @@ class App(tk.Tk):
         w, h, x0, y0 = self._r
         self.geometry(f"{max(400, w + e.x_root - x0)}x{max(300, h + e.y_root - y0)}")
 
+    def restart_preloader(self, pct=None):
+        """Keep a few random photos decoded and sized in the background, so the next click is instant."""
+        if self.preloader:
+            self.preloader.stop()
+            self.preloader = None
+        if self.files:
+            self.preloader = Preloader(self.files, self.winfo_screenwidth(), self.winfo_screenheight(),
+                                       pct or self.size_pct)
+            self.preloader.start()
+
     def load(self, folder):
         self.files = [os.path.join(r, f) for r, _, fs in os.walk(folder)
                       for f in fs if os.path.splitext(f)[1].lower() in EXTS]
         self.history, self.pos, self.current = [], -1, None
+        self.restart_preloader()
         if self.files:
             self.next()
         else:
@@ -939,6 +962,9 @@ class App(tk.Tk):
         if self.pos < len(self.history) - 1:
             self.pos += 1
         else:
+            item = self.preloader.get() if self.preloader and not self.is_full else None
+            if item:  # already decoded and sized in the background
+                return self.apply_prepared(item)
             self.history.append(random.choice(self.files))
             self.pos = len(self.history) - 1
         self.current = self.history[self.pos]
@@ -979,6 +1005,8 @@ class App(tk.Tk):
         self.tk_img = ImageTk.PhotoImage(img)
         self.canvas.configure(image=self.tk_img, text="")
         self._last_key = (path, nw, nh)
+        self._prepared = (path, nw, nh)
+        self.info.configure(text=f"{os.path.basename(path)}  ({self.pos + 1}/{len(self.history)})")
 
     def load_image(self, path):
         """Decode once and keep a screen-sized copy; re-rendering then stays fast."""
@@ -1000,6 +1028,10 @@ class App(tk.Tk):
     def render(self, fit=False):
         if not self.current:
             return
+        pre = getattr(self, "_prepared", None)
+        if (not fit and pre and pre[0] == self.current and not self.is_full
+                and abs(self.winfo_width() - pre[1]) <= 3 and abs(self.winfo_height() - pre[2]) <= 3):
+            return  # this photo was just placed at exactly this size: nothing to redo
         try:
             base, orig = self.load_image(self.current)
         except Exception:
@@ -1108,6 +1140,8 @@ class App(tk.Tk):
     def set_size(self, pct):
         self.size_pct = pct
         self.write_settings(size=pct)
+        if not self.saver:
+            self.restart_preloader()
         self.refresh_bars()
         if not self.is_full:
             self.render(fit=True)
@@ -1178,7 +1212,7 @@ class App(tk.Tk):
             self.is_full = False
             self.attributes("-topmost", False)
             self.update_idletasks()
-            w, h, x, y = (int(v) for v in re.match(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)", self._normal_geo).groups())
+            w, h, x, y = (int(v) for v in re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", self._normal_geo).groups())
             self.geometry(self._normal_geo)
             self.update_idletasks()
             try:
@@ -1204,68 +1238,184 @@ class App(tk.Tk):
         self.after(60, lambda: self.render(fit=not self.is_full))
 
     # ---- updater ----
+    def notify(self, kind, text):
+        """showinfo / showerror / askyesno that always appears in front (a borderless window
+        can otherwise leave the dialog hidden behind other windows)."""
+        was_top = bool(self.attributes("-topmost"))
+        self.attributes("-topmost", True)
+        self.lift()
+        try:
+            return getattr(messagebox, kind)(APP_NAME, text, parent=self)
+        finally:
+            self.attributes("-topmost", was_top)
+
+    @staticmethod
+    def _ver(v):
+        return tuple(int(x) for x in re.findall(r"\d+", str(v))[:3])
+
     def check_updates(self, manual):
         if not UPDATE_URL:
             if manual:
-                messagebox.showinfo(APP_NAME, "No update server is configured in this build.")
+                self.notify("showinfo", "No update server is configured in this build.")
             return
+        results = queue.Queue()  # the network runs in a thread; only the main thread touches Tk
 
         def work():
             try:
-                with urllib.request.urlopen(UPDATE_URL, timeout=10) as r:
-                    data = json.load(r)
-                self.after(0, lambda: self.offer_update(data, manual))
-            except Exception as e:
-                if manual:
-                    self.after(0, lambda: messagebox.showerror(APP_NAME, f"Update check failed:\n{e}"))
+                req = urllib.request.Request(f"{UPDATE_URL}?t={int(time.time())}",
+                                             headers={"User-Agent": f"PhotoViewer/{APP_VERSION}"})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    results.put(("ok", json.load(r)))
+            except Exception as err:
+                results.put(("error", err))
+
+        def poll():
+            try:
+                kind, value = results.get_nowait()
+            except queue.Empty:
+                return self.after(100, poll)
+            if kind == "ok":
+                self.offer_update(value, manual)
+            elif manual:
+                self.notify("showerror", f"Update check failed:\n{value}")
         threading.Thread(target=work, daemon=True).start()
+        poll()
 
     def offer_update(self, data, manual):
-        def ver(v):
-            return tuple(int(x) for x in str(v).split("."))
-        if ver(data["version"]) <= ver(APP_VERSION):
+        try:
+            newest, version, url = self._ver(data["version"]), data["version"], data["url"]
+        except Exception:
             if manual:
-                messagebox.showinfo(APP_NAME, f"You're up to date (v{APP_VERSION}).")
+                self.notify("showerror", "The update information was not in the expected format.")
             return
-        if not messagebox.askyesno(APP_NAME, f"Version {data['version']} is available "
-                                   f"(you have {APP_VERSION}). Update now?"):
+        if newest <= self._ver(APP_VERSION):
+            if manual:
+                self.notify("showinfo", f"You're up to date (v{APP_VERSION}).")
+            return
+        if not self.notify("askyesno", f"Version {version} is available "
+                           f"(you have {APP_VERSION}). Update now?"):
             return
         if not getattr(sys, "frozen", False):
-            messagebox.showinfo(APP_NAME, "Updating only works in the installed program.")
+            self.notify("showinfo", "Updating only works in the packaged PhotoViewer.exe.")
             return
-        try:
-            exe = sys.executable
-            new = exe + ".new"
-            urllib.request.urlretrieve(data["url"], new)
-            bat = os.path.join(tempfile.gettempdir(), "pv_update.bat")
-            with open(bat, "w") as f:
-                f.write('@echo off\r\nping 127.0.0.1 -n 3 >nul\r\n'
-                        f'move /y "{new}" "{exe}"\r\nstart "" "{exe}"\r\ndel "%~f0"\r\n')
-            subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)
-            self.destroy()
-        except Exception as e:
-            messagebox.showerror(APP_NAME, f"Update failed:\n{e}")
+        self.download_update(url)
+
+    def download_update(self, url):
+        exe = sys.executable
+        new = exe + ".new"
+        state = {"done": 0, "total": 0, "err": None, "finished": False}
+
+        def work():
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": f"PhotoViewer/{APP_VERSION}"})
+                with urllib.request.urlopen(req, timeout=30) as r, open(new, "wb") as f:
+                    state["total"] = int(r.headers.get("Content-Length") or 0)
+                    while True:
+                        chunk = r.read(262144)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        state["done"] += len(chunk)
+                with open(new, "rb") as f:
+                    head = f.read(2)
+                if head != b"MZ" or os.path.getsize(new) < 1_000_000:
+                    raise ValueError("The downloaded file is not a valid program.")
+            except Exception as err:
+                state["err"] = err
+            state["finished"] = True
+
+        def poll():
+            if not state["finished"]:
+                pct = f"{state['done'] * 100 // state['total']}%" if state["total"] else f"{state['done'] // 1024} KB"
+                self.title(f"Downloading update… {pct}")
+                self.info.configure(text=f"Downloading update… {pct}")
+                return self.after(150, poll)
+            self.title(f"Random Photo Viewer {APP_VERSION}")
+            if state["err"]:
+                try:
+                    os.remove(new)
+                except OSError:
+                    pass
+                self.notify("showerror", f"Update failed:\n{state['err']}")
+            else:
+                self.apply_update(new, exe)
+        threading.Thread(target=work, daemon=True).start()
+        poll()
+
+    def apply_update(self, new, exe):
+        """Swap the downloaded file in once this program has fully exited, then start it again."""
+        bat = os.path.join(tempfile.gettempdir(), "pv_update.bat")
+        with open(bat, "w") as f:
+            f.write(
+                '@echo off\r\n'
+                'set n=0\r\n'
+                ':retry\r\n'
+                'ping 127.0.0.1 -n 2 >nul\r\n'
+                f'move /y "{new}" "{exe}" >nul 2>&1\r\n'
+                'if not errorlevel 1 goto done\r\n'
+                'set /a n+=1\r\n'
+                'if %n% lss 60 goto retry\r\n'  # the old program is still closing; keep trying ~1 minute
+                f'del "{new}" >nul 2>&1\r\n'
+                ':done\r\n'
+                'set PYINSTALLER_RESET_ENVIRONMENT=1\r\n'  # start a fresh copy, not a half-shared one
+                f'start "" "{exe}"\r\n'
+                '(goto) 2>nul & del "%~f0"\r\n')
+        env = {**os.environ, "PYINSTALLER_RESET_ENVIRONMENT": "1"}
+        # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP: keeps running after this program exits
+        subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000 | 0x00000200, env=env,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.destroy()
 
 
-def uninstall():
+def uninstall(confirm=True, key=UNINSTALL_KEY, shortcut_dirs=None, exe_dir=None):
+    """Remove an installed copy. Only acts on the copy the installer registered, and only deletes
+    this program's own files (never a whole folder), so running it elsewhere can't hurt anything."""
     import winreg
-    if not messagebox.askyesno(APP_NAME, "Uninstall Photo Viewer?"):
-        return
-    start = os.path.join(os.environ.get("APPDATA", ""), "Microsoft", "Windows",
-                         "Start Menu", "Programs")
-    for lnk in (os.path.join(start, "Photo Viewer.lnk"),
-                os.path.join(os.path.expanduser("~"), "Desktop", "Photo Viewer.lnk")):
-        if os.path.exists(lnk):
-            os.remove(lnk)
+    exe_dir = exe_dir or os.path.dirname(sys.executable)
     try:
-        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, UNINSTALL_KEY)
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key) as k:
+            location = winreg.QueryValueEx(k, "InstallLocation")[0]
+    except OSError:
+        location = None
+    same = lambda a, b: os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    if not location or not same(location, exe_dir):
+        messagebox.showinfo(APP_NAME, "This copy of Photo Viewer isn't installed, so there is nothing "
+                                      "to uninstall. To remove it, just delete the file.")
+        return False
+    if confirm and not messagebox.askyesno(APP_NAME, "Uninstall Photo Viewer?"):
+        return False
+    if shortcut_dirs is None:
+        shortcut_dirs = [d for d in (known_folder(0x02), known_folder(0x10)) if d]
+    for folder in shortcut_dirs:
+        lnk = os.path.join(folder, "Photo Viewer.lnk")
+        if os.path.exists(lnk):
+            try:
+                os.remove(lnk)
+            except OSError:
+                pass
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key)
     except OSError:
         pass
-    d = os.path.dirname(sys.executable)
-    # Delete the install folder after this process exits.
-    subprocess.Popen(["cmd", "/c", f'ping 127.0.0.1 -n 3 >nul & rmdir /s /q "{d}"'],
-                     creationflags=0x08000000)
+    # Delete the program's files once this process has fully exited, then the folder if it's empty.
+    bat = os.path.join(tempfile.gettempdir(), "pv_uninstall.bat")
+    with open(bat, "w") as f:
+        f.write(
+            '@echo off\r\n'
+            'set n=0\r\n'
+            ':retry\r\n'
+            'ping 127.0.0.1 -n 2 >nul\r\n'
+            f'del /f /q "{exe_dir}\\PhotoViewer.exe" "{exe_dir}\\PhotoViewer.exe.old*" "{exe_dir}\\PhotoViewer.exe.new" >nul 2>&1\r\n'
+            f'if not exist "{exe_dir}\\PhotoViewer.exe" goto done\r\n'
+            'set /a n+=1\r\n'
+            'if %n% lss 30 goto retry\r\n'
+            ':done\r\n'
+            f'rmdir "{exe_dir}" >nul 2>&1\r\n'
+            '(goto) 2>nul & del "%~f0"\r\n')
+    subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000 | 0x00000200,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     messagebox.showinfo(APP_NAME, "Photo Viewer was uninstalled.")
+    return True
 
 
 if __name__ == "__main__":
@@ -1280,7 +1430,7 @@ if __name__ == "__main__":
         build_saver_settings(root)
         root.mainloop()
     else:
-        app = App()
+        app = App(auto_update="s" not in flags)
         if "s" in flags:  # run as a Windows screensaver: start at once, quit when touched
             app.after(400, lambda: app.start_screensaver(quit_on_exit=True))
         app.mainloop()
