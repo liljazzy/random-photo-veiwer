@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Random Photo Viewer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; background: #111; color: #eee; font-family: system-ui, sans-serif; }
+  body { display: flex; flex-direction: column; }
+  #stage { flex: 1; display: flex; align-items: center; justify-content: center; min-height: 0; padding: 12px; position: relative; }
+  #photo { max-width: 100%; max-height: 100%; object-fit: contain; border-radius: 6px; box-shadow: 0 8px 40px #000a; transition: opacity .25s; }
+  #photo.loading { opacity: .25; }
+  #msg { position: absolute; color: #888; text-align: center; pointer-events: none; }
+  #bar { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; align-items: center; padding: 12px; background: #1b1b1b; }
+  button, label.btn { background: #2d2d2d; color: #eee; border: 1px solid #444; padding: 8px 14px; border-radius: 6px; font: inherit; cursor: pointer; }
+  button:hover, label.btn:hover { background: #3a3a3a; }
+  button.primary { background: #3b82f6; border-color: #3b82f6; }
+  button.primary:hover { background: #2f6fd8; }
+  #info { color: #999; font-size: .85rem; min-width: 8em; text-align: center; }
+  input[type=file] { display: none; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <img id="photo" alt="">
+  <div id="msg">Press <b>Next</b> for a random photo,<br>or open your own photos / folder.</div>
+</div>
+<div id="bar">
+  <button id="prev">◀ Back</button>
+  <button id="next" class="primary">Random ▶</button>
+  <label class="btn">Open photos<input id="files" type="file" accept="image/*" multiple></label>
+  <label class="btn">Open folder<input id="folder" type="file" webkitdirectory></label>
+  <button id="online">Online photos</button>
+  <button id="auto">Auto: off</button>
+  <button id="full">Fullscreen</button>
+  <span id="info"></span>
+</div>
+<script>
+const $ = id => document.getElementById(id);
+const photo = $('photo'), msg = $('msg'), info = $('info');
+let local = [];          // local File objects
+let history = [], pos = -1;
+let timer = null;
+
+const useLocal = () => local.length > 0;
+
+function pick() {
+  if (useLocal()) {
+    const f = local[Math.floor(Math.random() * local.length)];
+    return { src: URL.createObjectURL(f), label: f.webkitRelativePath || f.name };
+  }
+  const seed = Math.random().toString(36).slice(2, 10);
+  return { src: `https://picsum.photos/seed/${seed}/1600/1000`, label: 'Online #' + seed };
+}
+
+function show(item) {
+  msg.style.display = 'none';
+  photo.classList.add('loading');
+  photo.onload = () => photo.classList.remove('loading');
+  photo.onerror = () => { photo.classList.remove('loading'); msg.style.display = ''; msg.textContent = 'Could not load that image.'; };
+  photo.src = item.src;
+  info.textContent = item.label;
+}
+
+function next() {
+  if (pos < history.length - 1) { show(history[++pos]); return; }
+  const item = pick();
+  history.push(item); pos = history.length - 1;
+  show(item);
+}
+function prev() { if (pos > 0) show(history[--pos]); }
+
+function setLocal(list) {
+  local = [...list].filter(f => f.type.startsWith('image/'));
+  history = []; pos = -1;
+  if (local.length) next(); else { msg.style.display = ''; msg.textContent = 'No images found.'; }
+}
+
+$('next').onclick = next;
+$('prev').onclick = prev;
+$('files').onchange = e => setLocal(e.target.files);
+$('folder').onchange = e => setLocal(e.target.files);
+$('online').onclick = () => { local = []; history = []; pos = -1; next(); };
+$('full').onclick = () => document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen();
+$('auto').onclick = () => {
+  if (timer) { clearInterval(timer); timer = null; $('auto').textContent = 'Auto: off'; }
+  else { timer = setInterval(next, 4000); $('auto').textContent = 'Auto: 4s'; }
+};
+addEventListener('keydown', e => {
+  if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); next(); }
+  else if (e.key === 'ArrowLeft') prev();
+  else if (e.key === 'f') $('full').click();
+});
+</script>
+</body>
+</html>
