@@ -1,8 +1,13 @@
+import atexit
+import hashlib
+import importlib
+import io
 import json
 import queue
 import math
 import os
 import re
+import shutil
 import random
 import ctypes
 import subprocess
@@ -13,15 +18,19 @@ import time
 from collections import deque
 import tkinter as tk
 import urllib.request
+import zipfile
 from tkinter import filedialog, messagebox, simpledialog
 
 from PIL import Image, ImageOps, ImageTk
 
 APP_NAME = "Photo Viewer"
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.6.0"
 # The updater reads this file: {"version": "1.4.1", "url": "https://.../PhotoViewer.exe"}
 UPDATE_URL = "https://raw.githubusercontent.com/liljazzy/random-photo-veiwer/main/version.json"
 UNINSTALL_KEY = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\PhotoViewer"
+
+# "Wander": now and then a resting photo window launches itself. Seconds between launches (low, high).
+WANDER_LEVELS = {"Off": None, "Rare": (25, 60), "Sometimes": (10, 25), "Often": (4, 10)}
 
 BOUNCE_LEVELS = {"Off": 0.0, "Low": 0.5, "Normal": 0.85, "High": 1.0, "Super": 1.2}
 
@@ -29,6 +38,124 @@ SIZE_LEVELS = (40, 50, 67, 80, 100, 130, 160)  # percent of the full fit-to-scre
 DEFAULT_SIZE = 67
 
 EXTS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
+VIDEO_EXTS = {".mp4", ".m4v", ".mov", ".avi", ".mkv", ".webm", ".wmv", ".flv", ".mpg", ".mpeg"}
+# Videos are decoded by ffmpeg. It is not bundled (it is ~90 MB); on first use the program offers to fetch the
+# official Windows build from the imageio-ffmpeg package on PyPI, verified against PyPI's published SHA-256.
+PYPI_FFMPEG_JSON = "https://pypi.org/pypi/imageio-ffmpeg/json"
+
+
+def local_data_dir():
+    return os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PhotoViewer")
+
+
+def ffmpeg_exe():
+    """Path to ffmpeg, or None if video support hasn't been downloaded yet."""
+    p = os.path.join(local_data_dir(), "ffmpeg.exe")
+    if os.path.exists(p):
+        return p
+    try:  # a development machine may have the pip package (imported by name so it is never bundled)
+        return importlib.import_module("imageio" + "_ffmpeg").get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def is_video(path):
+    return os.path.splitext(path)[1].lower() in VIDEO_EXTS
+
+
+_NO_WINDOW = 0x08000000
+_VIDEO_PROCS = set()  # running ffmpeg decoders, so none can outlive the program
+_FPS_CACHE = {}
+
+
+@atexit.register
+def _kill_video_procs():
+    for proc in list(_VIDEO_PROCS):
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def probe_video(path):
+    """(frames per second, length in seconds or None) of a video; cached."""
+    if path not in _FPS_CACHE:
+        fps, length = 30.0, None
+        try:
+            r = subprocess.run([ffmpeg_exe(), "-hide_banner", "-nostdin", "-i", path], capture_output=True,
+                               text=True, errors="replace", creationflags=_NO_WINDOW, timeout=30)
+            m = re.search(r"(\d+(?:\.\d+)?) fps", r.stderr) or re.search(r"(\d+(?:\.\d+)?) tbr", r.stderr)
+            if m:
+                fps = min(max(float(m.group(1)), 1.0), 120.0)
+            d = re.search(r"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr)
+            if d:
+                length = int(d.group(1)) * 3600 + int(d.group(2)) * 60 + float(d.group(3))
+        except Exception:
+            pass
+        _FPS_CACHE[path] = (fps, length)
+    return _FPS_CACHE[path]
+
+
+def video_first_frame(path):
+    """The first frame of a video as an image (rotation metadata already applied by ffmpeg)."""
+    exe = ffmpeg_exe()
+    if not exe:
+        raise OSError("Video support isn't installed")
+    r = subprocess.run([exe, "-v", "error", "-nostdin", "-i", path, "-frames:v", "1", "-f", "image2pipe",
+                        "-c:v", "png", "-"], capture_output=True, creationflags=_NO_WINDOW, timeout=60)
+    if r.returncode != 0 or not r.stdout:
+        raise OSError("Can't read this video")
+    img = Image.open(io.BytesIO(r.stdout))
+    img.load()
+    return img
+
+
+def open_media(path):
+    """Open a photo, GIF or video. Returns (image, animated); for videos the image is the first frame."""
+    if is_video(path):
+        return video_first_frame(path), True
+    img = Image.open(path)
+    return img, Animator.is_animated(img)
+
+
+def download_ffmpeg(state):
+    """Worker thread: fetch ffmpeg from PyPI's imageio-ffmpeg wheel, check its SHA-256, unpack it."""
+    tmp = os.path.join(local_data_dir(), "ffmpeg_download.whl")
+    try:
+        os.makedirs(local_data_dir(), exist_ok=True)
+        req = urllib.request.Request(PYPI_FFMPEG_JSON, headers={"User-Agent": f"PhotoViewer/{APP_VERSION}"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            meta = json.load(r)
+        wheel = next(f for f in meta["urls"] if f["filename"].endswith("win_amd64.whl"))
+        state["total"] = wheel["size"]
+        digest = hashlib.sha256()
+        with urllib.request.urlopen(wheel["url"], timeout=30) as r, open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(262144)
+                if not chunk:
+                    break
+                f.write(chunk)
+                digest.update(chunk)
+                state["done"] += len(chunk)
+        if digest.hexdigest() != wheel["digests"]["sha256"]:
+            raise ValueError("The download failed its integrity check, so it was discarded.")
+        out = os.path.join(local_data_dir(), "ffmpeg.exe")
+        with zipfile.ZipFile(tmp) as z:
+            name = next(n for n in z.namelist() if n.startswith("imageio_ffmpeg/binaries/") and n.endswith(".exe"))
+            with z.open(name) as src, open(out + ".tmp", "wb") as dst:
+                shutil.copyfileobj(src, dst)
+        test = subprocess.run([out + ".tmp", "-version"], capture_output=True, creationflags=_NO_WINDOW, timeout=30)
+        if test.returncode != 0:
+            raise ValueError("The downloaded ffmpeg did not start.")
+        os.replace(out + ".tmp", out)
+    except Exception as err:
+        state["err"] = err
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        state["finished"] = True
 
 
 def resource_path(name):
@@ -230,7 +357,7 @@ class Preloader(threading.Thread):
         while self.running:
             try:
                 path = random.choice(self.files)
-                img = Image.open(path)
+                img, animated = open_media(path)
                 iw, ih = img.size
                 if img.getexif().get(274, 1) in (5, 6, 7, 8):  # rotated photo: width and height swap
                     iw, ih = ih, iw
@@ -240,7 +367,7 @@ class Preloader(threading.Thread):
                 except Exception:
                     pass
                 img = ImageOps.exif_transpose(img).convert("RGB").resize((nw, nh), Image.BICUBIC)
-                item = (path, img, (nw, nh))
+                item = (path, img, (nw, nh), animated)
             except Exception:
                 time.sleep(0.05)
                 continue
@@ -259,6 +386,212 @@ class Preloader(threading.Thread):
 
     def stop(self):
         self.running = False
+
+
+class Animator:
+    """Plays an animated GIF (or animated WebP / PNG) inside a label, at a fixed display size.
+    A background thread decodes and resizes the frames; this object only shows them, so playback never
+    stalls the window. Once every frame has been seen they are kept and the thread is stopped."""
+
+    CACHE_BYTES = 250_000_000
+
+    def __init__(self, label):
+        self.label = label
+        self.token = 0       # bumps on every start/stop, so stale timers and threads know to quit
+        self.after_id = None
+        self.img = None      # set while playing (also tells callers whether something is running)
+        self.frames = []     # (PhotoImage, delay_ms) kept for later loops
+        self.shown = None    # the PhotoImage on screen (Tk drops images nobody holds on to)
+        self.q = None
+        self.proc = None     # the ffmpeg process while a video plays
+        self.vphoto = None   # the single picture a video is painted into
+        self.video_done = True   # False while a video is still on its first play-through
+
+    @staticmethod
+    def is_animated(img):
+        return getattr(img, "n_frames", 1) > 1
+
+    def start(self, path, size):
+        self.stop()
+        if is_video(path):
+            return self._start_video(path, size)
+        try:
+            probe = Image.open(path)
+            if not self.is_animated(probe):
+                return False
+            self.n = probe.n_frames
+        except Exception:
+            return False
+        self.img = True
+        self.size, self.i, self.frames = size, 0, []
+        self.cacheable = self.n * size[0] * size[1] * 4 <= self.CACHE_BYTES
+        self.cached_all = False
+        self.q = queue.Queue(maxsize=3)
+        self.token += 1
+        threading.Thread(target=self._decode, args=(path, size, self.token, self.q), daemon=True).start()
+        self.tick(self.token)
+        return True
+
+    def _decode(self, path, size, token, q):
+        """Worker thread: frames in order, forever (until stopped). Touches PIL only, never Tk."""
+        try:
+            img = Image.open(path)
+            i = 0
+            while token == self.token:
+                img.seek(i)
+                delay = img.info.get("duration", 100) or 100
+                delay = 100 if delay <= 10 else max(20, delay)  # browsers treat tiny delays as 100 ms
+                frame = img.convert("RGBA").resize(size, Image.BILINEAR, reducing_gap=2.0)
+                while token == self.token:
+                    try:
+                        q.put((i, frame, delay), timeout=0.1)
+                        break
+                    except queue.Full:
+                        pass
+                i = (i + 1) % img.n_frames
+        except Exception:
+            pass
+
+    # ---- video: ffmpeg decodes and scales in its own process; we read finished frames from its pipe ----
+    def _start_video(self, path, size):
+        exe = ffmpeg_exe()
+        if not exe:
+            return False
+        w, h = size
+        self.fps, self.length = probe_video(path)
+        cmd = [exe, "-v", "error", "-nostdin", "-stream_loop", "-1", "-i", path, "-an", "-sn",
+               "-vf", f"scale={w}:{h}:flags=fast_bilinear", "-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, creationflags=_NO_WINDOW, bufsize=w * h * 6)
+        except OSError:
+            return False
+        _VIDEO_PROCS.add(proc)
+        self.proc, self.img, self.size, self.t0, self.count = proc, True, size, None, 0
+        self.video_done = self.length is None  # an unknown length can't be waited for
+        self.vphoto = None
+        self.q = queue.Queue(maxsize=3)
+        self.reader_done = False
+        self.token += 1
+        threading.Thread(target=self._read_video, args=(proc, w * h * 3, self.token, self.q), daemon=True).start()
+        self.tick_video(self.token)
+        return True
+
+    def _read_video(self, proc, nbytes, token, q):
+        """Worker thread: whole frames from ffmpeg's output pipe."""
+        try:
+            while token == self.token:
+                data = proc.stdout.read(nbytes)
+                if len(data) < nbytes:
+                    break
+                while token == self.token:
+                    try:
+                        q.put(data, timeout=0.1)
+                        break
+                    except queue.Full:
+                        pass
+        except Exception:
+            pass
+        finally:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            _VIDEO_PROCS.discard(proc)
+            if token == self.token:
+                self.reader_done = True
+
+    def tick_video(self, token):
+        if token != self.token or not self.img:
+            return
+        try:
+            now = time.perf_counter()
+            try:
+                frame = self.q.get_nowait()
+            except queue.Empty:
+                if self.reader_done:  # ffmpeg stopped producing frames: unreadable video
+                    return self.stop()
+                self.after_id = self.label.after(4, lambda: self.tick_video(token))
+                return
+            if self.t0 is None:
+                self.t0 = now
+            if not self.video_done and now - self.t0 >= self.length - 0.05:
+                self.video_done = True  # it has now played all the way through once (it keeps looping)
+            # If we have fallen behind the video's clock, drop frames to catch up instead of slowing down.
+            behind = int((now - self.t0) * self.fps) - self.count
+            while behind > 1:
+                try:
+                    frame = self.q.get_nowait()
+                except queue.Empty:
+                    break
+                self.count += 1
+                behind -= 1
+            self.count += 1
+            img = Image.frombuffer("RGB", self.size, frame, "raw", "RGB", 0, 1)
+            if self.vphoto is None:  # one picture, repainted in place: far cheaper than a new one per frame
+                self.vphoto = ImageTk.PhotoImage(img)
+                self.label.configure(image=self.vphoto)
+            else:
+                self.vphoto.paste(img)
+            self.shown = self.vphoto
+            wait = max(1, int((self.t0 + self.count / self.fps - time.perf_counter()) * 1000))
+            self.after_id = self.label.after(wait, lambda: self.tick_video(token))
+        except tk.TclError:  # the window was closed under us
+            self.img = None
+        except Exception:
+            self.stop()
+
+    def playing_unfinished(self):
+        """True while a video is still on its first play-through (auto mode waits for it)."""
+        return bool(self.proc) and not self.video_done
+
+    def stop(self):
+        self.video_done = True
+        if self.proc:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+            _VIDEO_PROCS.discard(self.proc)
+            self.proc = None
+        self.token += 1
+        if self.after_id:
+            try:
+                self.label.after_cancel(self.after_id)
+            except Exception:
+                pass
+        self.after_id = None
+        self.img, self.frames, self.shown, self.q, self.vphoto = None, [], None, None, None
+
+    def tick(self, token):
+        if token != self.token or not self.img:
+            return
+        began = time.perf_counter()
+        try:
+            if self.cached_all:
+                photo, delay = self.frames[self.i]
+                self.i = (self.i + 1) % self.n
+            else:
+                try:
+                    i, frame, delay = self.q.get_nowait()
+                except queue.Empty:  # the thread hasn't finished the next frame yet
+                    self.after_id = self.label.after(4, lambda: self.tick(token))
+                    return
+                photo = ImageTk.PhotoImage(frame)
+                if self.cacheable and i == len(self.frames):
+                    self.frames.append((photo, delay))
+                    if len(self.frames) == self.n:  # seen them all: no more decoding needed
+                        self.cached_all, self.i = True, 0
+                        self.token += 1
+                        token = self.token
+            self.shown = photo
+            self.label.configure(image=photo)
+            wait = max(1, int(delay - (time.perf_counter() - began) * 1000))
+            self.after_id = self.label.after(wait, lambda: self.tick(token))
+        except tk.TclError:  # the window was closed under us
+            self.img = None
+        except Exception:
+            self.stop()
 
 
 SAVER_DEFAULTS = {"windows": 5, "size": 30, "speed": 350, "trigger": "collision", "secs": 4}
@@ -350,6 +683,7 @@ class MenuBar(tk.Frame):
         self.owner, self.app = owner, app
         self.shown = False
         self.btns = []  # (button, full-label function, compact label)
+        self.hidden = 0  # how many trailing buttons are dropped because the window is too narrow
         for full, short, cmd in specs:
             b = tk.Button(self, bg="#2d2d2d", fg="#eee", relief="flat")
             b.configure(command=lambda b=b, cmd=cmd: self._press(b, cmd))
@@ -376,7 +710,7 @@ class MenuBar(tk.Frame):
     def style(self, size, compact):
         font = ("Segoe UI", size)
         for b, full, short in self.btns:
-            b.configure(text=short if compact else full(), font=font,
+            b.configure(text=(short() if callable(short) else short) if compact else full(), font=font,
                         padx=size // 2 + 1 if compact else size, pady=size // 2)
             b.pack_configure(padx=max(size // 2, 2), pady=size // 2 + 2)
         self.close_btn.configure(font=font, padx=size, pady=size // 2)
@@ -392,6 +726,12 @@ class MenuBar(tk.Frame):
     def scale(self, width=None):
         """Size the text and buttons so everything fits the window's width."""
         w = width or self.owner.winfo_width()
+        if self.hidden:  # bring every button back first, in order
+            for b, _, _ in self.btns:
+                b.pack_forget()
+            for b, _, _ in self.btns:
+                b.pack(side="left")
+            self.hidden = 0
         base = max(7, min(16, round(w / 90)))
         for compact in (False, True):
             for size in range(base, 5 if compact else 7, -1):  # full labels never below 8pt
@@ -399,6 +739,14 @@ class MenuBar(tk.Frame):
                 self.update_idletasks()
                 if self.winfo_reqwidth() <= w:
                     return
+        # Not even small icons fit (a very narrow window): drop the later buttons, last first,
+        # but always keep the first three (Folder, Back, Next) and the close button.
+        for k in range(len(self.btns) - 1, 2, -1):
+            self.btns[k][0].pack_forget()
+            self.hidden += 1
+            self.update_idletasks()
+            if self.winfo_reqwidth() <= w:
+                return
 
     def set_shown(self, on):
         if on and not self.shown:
@@ -418,23 +766,31 @@ class PhotoWindow(tk.Toplevel):
         super().__init__(app)
         self.app = app
         self.overrideredirect(True)
+        self.attributes("-topmost", app.always_on_top)
         self.configure(bg="#111")
         self.label = tk.Label(self, bg="#111", bd=0, cursor="hand2")
         self.label.pack(fill="both", expand=True)
+        self.anim = Animator(self.label)
         self.path, self.history, self.hpos = path, [path], 0
         self.body = Body(app, self, blocked=lambda: app.saver)
         self.menu = MenuBar(self, app, self.body, [
             ("Folder", "📂", app.open_folder), ("◀ Back", "◀", self.prev_photo),
             ("Random ▶", "▶", self.next_photo),
             (app.auto_label, "Auto", app.auto_menu), (app.bounce_label, "⤴", app.bounce_menu),
-            (app.size_label, "⤢", app.size_menu), ("＋ Add", "＋", app.add_image)],
+            (app.size_label, "⤢", app.size_menu), (app.top_label, app.top_short, app.toggle_top),
+            (app.wander_label, app.wander_short, app.wander_menu),
+            ("＋ Add", "＋", app.add_image)],
             closer=lambda: app.remove_extra(self))
         self.body.bind(self.label, self.next_photo, self.prev_photo)
         self.label.bind("<Button-2>", lambda e: self.reveal())
         self.show(path, x, y)
 
+    def destroy(self):
+        self.anim.stop()
+        super().destroy()
+
     def show(self, path, x=None, y=None):
-        base = Image.open(path)
+        base, animated = open_media(path)
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         try:
             base.draft("RGB", (sw, sh))
@@ -449,6 +805,10 @@ class PhotoWindow(tk.Toplevel):
         x, y = min(max(x, mx), mx + mw - nw), min(max(y, my), my + mh - nh)
         self.tk_img = ImageTk.PhotoImage(base.resize((nw, nh), Image.BICUBIC))
         self.label.configure(image=self.tk_img)
+        if animated:
+            self.anim.start(path, (nw, nh))
+        else:
+            self.anim.stop()
         self.geometry(f"{nw}x{nh}+{round(x)}+{round(y)}")
         self.update_idletasks()
         self.path = path
@@ -459,13 +819,17 @@ class PhotoWindow(tk.Toplevel):
         self.body.place()
 
     def show_prepared(self, item):
-        path, img, (nw, nh) = item
+        path, img, (nw, nh), animated = item
         ow, oh = self.body.size()
         mx, my, mw, mh = self.app.monitor_rect()
         x = min(max(self.body.pos[0] + ow / 2 - nw / 2, mx), mx + mw - nw)
         y = min(max(self.body.pos[1] + oh / 2 - nh / 2, my), my + mh - nh)
         self.tk_img = ImageTk.PhotoImage(img)
         self.label.configure(image=self.tk_img)
+        if animated:
+            self.anim.start(path, (nw, nh))
+        else:
+            self.anim.stop()
         self.geometry(f"{nw}x{nh}")
         self.path = path
         self.history.append(path)
@@ -535,6 +899,8 @@ class App(tk.Tk):
         self.canvas = tk.Label(self, bg="#111", fg="#888", cursor="hand2",
                                text="Open a folder to start (Ctrl+O)")
         self.canvas.pack(fill="both", expand=True)
+        self.anim = Animator(self.canvas)
+        self.cur_anim = False
 
         self.auto_on = False
         self.auto_secs = 4
@@ -542,7 +908,13 @@ class App(tk.Tk):
         self.size_pct = saved.get("size") if isinstance(saved.get("size"), (int, float)) and 10 <= saved["size"] <= 300 else DEFAULT_SIZE
         saved_bounce = saved.get("bounce")
         self.bounce_name = saved_bounce if saved_bounce in BOUNCE_LEVELS else "Normal"
+        self.always_on_top = bool(saved.get("topmost", False))
+        self.wander_name = saved.get("wander") if saved.get("wander") in WANDER_LEVELS else "Off"
+        self._wander_id = None
         self.menu_open = False
+        self.folder = None
+        self.skipped_videos = 0
+        self._ffmpeg_state = None
         self.anchor_btn = self.anchor_menu = None
         self.extras = []  # extra PhotoWindows
         self.saver = False
@@ -562,7 +934,9 @@ class App(tk.Tk):
             ("Folder", "📂", self.open_folder), ("◀ Back", "◀", self.prev),
             ("Random ▶", "▶", self.next),
             (self.auto_label, "Auto", self.auto_menu), (self.bounce_label, "⤴", self.bounce_menu),
-            (self.size_label, "⤢", self.size_menu), ("＋ Add", "＋", self.add_image),
+            (self.size_label, "⤢", self.size_menu), (self.top_label, self.top_short, self.toggle_top),
+            (self.wander_label, self.wander_short, self.wander_menu),
+            ("＋ Add", "＋", self.add_image),
             ("🌙 Saver", "🌙", self.start_screensaver), ("⚙ Setup", "⚙", self.saver_settings),
             ("Fullscreen", "⛶", self.toggle_full),
             ("Updates", "⟳", lambda: self.check_updates(True))],
@@ -578,6 +952,7 @@ class App(tk.Tk):
         self.bind("<Control-o>", lambda e: self.open_folder())
         self.bind("q", lambda e: self.destroy())
         self.bind("s", lambda e: self.start_screensaver())
+        self.bind("v", lambda e: self.ask_video_support())
         # Re-render once the window has settled; the label's own size lags behind and can
         # still be the old (larger) one mid-resize, which left the photo stuck enlarged.
         self._rid = None
@@ -591,6 +966,8 @@ class App(tk.Tk):
         self.after(300, self.sync_body)
         self.after(100, self.poll_hover)
         self.focus_force()
+        self.apply_top()
+        self.schedule_wander()
 
         saved = self.read_settings().get("folder")
         default = os.path.join(os.path.expanduser("~"), "Pictures")
@@ -915,7 +1292,7 @@ class App(tk.Tk):
             ex.destroy()
         del self.extras[n_extras:]
         for w in [self] + self.extras:
-            w.attributes("-topmost", False)
+            w.attributes("-topmost", self.always_on_top)
         self.canvas.configure(cursor="hand2")
         self.size_pct = self._saved_size
         self.restart_preloader()
@@ -975,8 +1352,21 @@ class App(tk.Tk):
             self.preloader.start()
 
     def load(self, folder):
-        self.files = [os.path.join(r, f) for r, _, fs in os.walk(folder)
-                      for f in fs if os.path.splitext(f)[1].lower() in EXTS]
+        self.anim.stop()
+        self.folder = folder
+        photos, videos = [], []
+        for r, _, fs in os.walk(folder):
+            for f in fs:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in EXTS:
+                    photos.append(os.path.join(r, f))
+                elif ext in VIDEO_EXTS:
+                    videos.append(os.path.join(r, f))
+        have_video = ffmpeg_exe() is not None
+        self.files = photos + (videos if have_video else [])
+        self.skipped_videos = 0 if have_video else len(videos)
+        if self.skipped_videos and not self.saver and self.read_settings().get("videos") != "no":
+            self.after(700, self.offer_video_support)
         self.history, self.pos, self.current = [], -1, None
         self.restart_preloader()
         if self.files:
@@ -1040,13 +1430,18 @@ class App(tk.Tk):
 
     def apply_prepared(self, item):
         """Swap in a photo that was already decoded and resized in the background."""
-        path, img, (nw, nh) = item
+        path, img, (nw, nh), animated = item
         self.history.append(path)
         self.pos = len(self.history) - 1
         self.current = path
         self.fit_window(0, 0, size=(nw, nh))
         self.tk_img = ImageTk.PhotoImage(img)
         self.canvas.configure(image=self.tk_img, text="")
+        if animated:
+            self.anim.start(path, (nw, nh))
+        else:
+            self.anim.stop()
+        self.cur_anim = animated
         self._last_key = (path, nw, nh)
         self._prepared = (path, nw, nh)
         self.info.configure(text=f"{os.path.basename(path)}  ({self.pos + 1}/{len(self.history)})")
@@ -1054,8 +1449,9 @@ class App(tk.Tk):
     def load_image(self, path):
         """Decode once and keep a screen-sized copy; re-rendering then stays fast."""
         if self._cache and self._cache[0] == path:
+            self.cur_anim = self._cache[3]
             return self._cache[1], self._cache[2]
-        img = Image.open(path)
+        img, self.cur_anim = open_media(path)
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
         try:
             img.draft("RGB", (sw, sh))  # JPEGs decode at reduced size
@@ -1065,7 +1461,7 @@ class App(tk.Tk):
         orig = img.size
         if img.width > sw or img.height > sh:
             img.thumbnail((sw, sh), Image.BILINEAR)
-        self._cache = (path, img, orig)
+        self._cache = (path, img, orig, self.cur_anim)
         return img, orig
 
     def render(self, fit=False):
@@ -1104,6 +1500,10 @@ class App(tk.Tk):
         img = base if (nw, nh) == base.size else base.resize((nw, nh), Image.BICUBIC)
         self.tk_img = ImageTk.PhotoImage(img)
         self.canvas.configure(image=self.tk_img, text="")
+        if self.cur_anim:
+            self.anim.start(self.current, (nw, nh))
+        else:
+            self.anim.stop()
 
     def reveal(self):
         if self.current and os.path.exists(self.current):
@@ -1117,6 +1517,86 @@ class App(tk.Tk):
 
     def size_label(self):
         return f"Size: {self.size_pct:g}%"
+
+    def wander_label(self):
+        return f"Wander: {self.wander_name.lower()}"
+
+    def wander_short(self):
+        return "🎲" if self.wander_name == "Off" else "🎲✓"
+
+    def wander_menu(self):
+        m = tk.Menu(self, tearoff=0)
+        notes = {"Off": "stay where you put them", "Rare": "about once a minute",
+                 "Sometimes": "every 10-25 seconds", "Often": "every 4-10 seconds"}
+        for name in WANDER_LEVELS:
+            tick = "  ✓" if name == self.wander_name else ""
+            m.add_command(label=f"{name}  ({notes[name]}){tick}", command=lambda n=name: self.set_wander(n))
+        self.menu_open = True
+        try:
+            btn = self.anchor_btn
+            m.tk_popup(btn.winfo_rootx(), btn.winfo_rooty())
+        finally:
+            m.grab_release()
+            self.menu_open = False
+
+    def set_wander(self, name):
+        self.wander_name = name
+        self.write_settings(wander=name)
+        self.schedule_wander()
+        self.refresh_bars()
+
+    def schedule_wander(self):
+        if self._wander_id:
+            self.after_cancel(self._wander_id)
+            self._wander_id = None
+        span = WANDER_LEVELS[self.wander_name]
+        if span:
+            self._wander_id = self.after(int(random.uniform(*span) * 1000), self.wander_tick)
+
+    def wander_tick(self):
+        self._wander_id = None
+        self.kick_one()
+        self.schedule_wander()
+
+    def kick_one(self):
+        """Launch one resting window in a random direction; physics does the bouncing from there."""
+        if self.saver or self.is_full or self.menu_open:
+            return
+        px, py = self.winfo_pointerxy()
+        resting = []
+        for bd in self.live_bodies():
+            if bd.held or (bd.vel[0] ** 2 + bd.vel[1] ** 2) ** 0.5 > 25:
+                continue  # being dragged, or already on the move
+            w, h = bd.size()
+            if bd.pos[0] <= px < bd.pos[0] + w and bd.pos[1] <= py < bd.pos[1] + h:
+                continue  # the cursor is on it: you are using it, so leave it alone
+            resting.append(bd)
+        if not resting:
+            return
+        bd = random.choice(resting)
+        angle, speed = random.uniform(0, 6.2832), random.uniform(600, 1400)
+        bd.vel = [speed * math.cos(angle), speed * math.sin(angle)]
+        self.start_physics()
+
+    def top_label(self):
+        return f"On top: {'on' if self.always_on_top else 'off'}"
+
+    def top_short(self):
+        return "📌✓" if self.always_on_top else "📌"
+
+    def apply_top(self):
+        """Keep the main window and all its clones above other windows (or let them sink normally).
+        Fullscreen and the screensaver need to stay on top regardless, so they are left alone."""
+        if self.saver:
+            return
+        for w in ([] if self.is_full else [self]) + self.extras:
+            w.attributes("-topmost", self.always_on_top)
+
+    def toggle_top(self):
+        self.always_on_top = not self.always_on_top
+        self.write_settings(topmost=self.always_on_top)
+        self.apply_top()
+        self.refresh_bars()
 
     def refresh_bars(self):
         self.scale_bar()
@@ -1210,9 +1690,12 @@ class App(tk.Tk):
         self.refresh_bars()
 
     def tick(self):
-        self.next()
+        # A video that hasn't played all the way through yet is left alone; it moves on at a later tick.
+        if not self.anim.playing_unfinished():
+            self.next()
         for ex in self.extras:
-            ex.next_photo()
+            if not ex.anim.playing_unfinished():
+                ex.next_photo()
         self.auto_id = self.after(int(self.auto_secs * 1000), self.tick)
 
     def scale_bar(self):
@@ -1253,7 +1736,7 @@ class App(tk.Tk):
         self.stop_throw()
         if self.is_full:
             self.is_full = False
-            self.attributes("-topmost", False)
+            self.attributes("-topmost", self.always_on_top)
             self.update_idletasks()
             w, h, x, y = (int(v) for v in re.match(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", self._normal_geo).groups())
             self.geometry(self._normal_geo)
@@ -1279,6 +1762,46 @@ class App(tk.Tk):
                 self.geometry(f"{w}x{h}+{x}+{y}")
         # Leaving fullscreen: refit the window to whatever photo is showing now.
         self.after(60, lambda: self.render(fit=not self.is_full))
+
+    # ---- video support (ffmpeg) ----
+    def offer_video_support(self, asked=False):
+        if ffmpeg_exe() or self.saver or getattr(self, "_ffmpeg_state", None):
+            return
+        n = self.skipped_videos
+        what = f"This folder has {n} video{'s' if n != 1 else ''}. " if n else ""
+        if self.notify("askyesno", f"{what}Playing videos needs ffmpeg, a one-time download of about 31 MB "
+                                   "from PyPI, the official Python package site (checked against its published "
+                                   "checksum). Download it now?"):
+            self.download_video_support()
+        elif not asked:
+            self.write_settings(videos="no")  # don't ask again every time; press V to be asked later
+
+    def download_video_support(self):
+        state = self._ffmpeg_state = {"done": 0, "total": 0, "err": None, "finished": False}
+        threading.Thread(target=download_ffmpeg, args=(state,), daemon=True).start()
+
+        def poll():
+            if not state["finished"]:
+                pct = f"{state['done'] * 100 // state['total']}%" if state["total"] else "…"
+                self.title(f"Downloading video support… {pct}")
+                self.info.configure(text=f"Downloading video support… {pct}")
+                return self.after(200, poll)
+            self._ffmpeg_state = None
+            self.title(f"Random Photo Viewer {APP_VERSION}")
+            if state["err"]:
+                self.notify("showerror", f"Couldn't set up video support:\n{state['err']}")
+            else:
+                self.write_settings(videos="yes")
+                self.load(self.folder)  # rescan, this time including the videos
+        poll()
+
+    def ask_video_support(self):
+        """The V key: explain or (re)offer video support."""
+        if ffmpeg_exe():
+            self.notify("showinfo", "Video support is installed. Videos in your folder play like GIFs "
+                                    "(silently, on a loop).")
+        else:
+            self.offer_video_support(asked=True)
 
     # ---- updater ----
     def notify(self, kind, text):
